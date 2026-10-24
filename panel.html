@@ -1,0 +1,1015 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>YOLO 训练工作台</title>
+    <!--
+      自足的 HTML（宿主把面板渲染在不透明源的 iframe 里，没有外链可加载）。
+      跟插件进程说话只有一条路：`uartix.call(方法名, 参数)`；反过来是 `uartix.on(事件)`。
+    -->
+    <style>
+      :root {
+        color-scheme: dark light;
+        --bg: #16181c;
+        --panel: #1c1f24;
+        --inset: #121417;
+        --fg: #e6e8eb;
+        --dim: #9aa0a6;
+        --faint: #6b7178;
+        --line: #2b3036;
+        --accent: #4a9eff;
+        --ok: #3fb950;
+        --warn: #d29922;
+        --bad: #f85149;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #fbfbfc;
+          --panel: #f4f5f7;
+          --inset: #ffffff;
+          --fg: #1c1f23;
+          --dim: #5a616b;
+          --faint: #8b929b;
+          --line: #e1e4e8;
+          --accent: #1a73e8;
+          --ok: #1a7f37;
+          --warn: #9a6700;
+          --bad: #cf222e;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font: 12px/1.5 "Segoe UI", system-ui, "Microsoft YaHei", sans-serif;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--line);
+        flex: 0 0 auto;
+      }
+      header h1 {
+        font-size: 13px;
+        font-weight: 600;
+        margin: 0;
+      }
+      header .path {
+        color: var(--dim);
+        font-family: "Cascadia Mono", Consolas, monospace;
+        font-size: 11px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 46%;
+      }
+      .spacer {
+        flex: 1 1 auto;
+      }
+      nav {
+        display: flex;
+        gap: 2px;
+        padding: 0 8px;
+        border-bottom: 1px solid var(--line);
+        flex: 0 0 auto;
+      }
+      nav button {
+        background: none;
+        border: none;
+        border-bottom: 2px solid transparent;
+        color: var(--dim);
+        padding: 6px 12px;
+        font: inherit;
+        cursor: pointer;
+      }
+      nav button.on {
+        color: var(--fg);
+        border-bottom-color: var(--accent);
+      }
+      main {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: auto;
+        padding: 12px;
+      }
+      section[hidden] {
+        display: none;
+      }
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 10px 12px;
+        margin-bottom: 10px;
+      }
+      .card h2 {
+        font-size: 12px;
+        font-weight: 600;
+        margin: 0 0 8px;
+        color: var(--fg);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 8px 12px;
+      }
+      label {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        font-size: 11px;
+        color: var(--dim);
+      }
+      label.wide {
+        grid-column: 1 / -1;
+      }
+      input,
+      textarea {
+        font: inherit;
+        font-size: 12px;
+        padding: 4px 6px;
+        border-radius: 5px;
+        border: 1px solid var(--line);
+        background: var(--inset);
+        color: var(--fg);
+        width: 100%;
+      }
+      textarea {
+        min-height: 54px;
+        resize: vertical;
+        font-family: "Cascadia Mono", Consolas, monospace;
+        font-size: 11px;
+      }
+      button.btn {
+        font: inherit;
+        padding: 5px 12px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--inset);
+        color: var(--fg);
+        cursor: pointer;
+      }
+      button.btn:hover:not(:disabled) {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+      button.btn:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      button.primary {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+      button.danger {
+        border-color: var(--bad);
+        color: var(--bad);
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .kv {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 2px 12px;
+        font-size: 11px;
+      }
+      .kv b {
+        font-weight: 500;
+        color: var(--dim);
+      }
+      .kv span {
+        font-family: "Cascadia Mono", Consolas, monospace;
+        word-break: break-all;
+      }
+      .tag {
+        display: inline-block;
+        padding: 0 6px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        font-size: 10px;
+        line-height: 16px;
+        color: var(--dim);
+      }
+      .tag.ok {
+        color: var(--ok);
+        border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+      }
+      .tag.bad {
+        color: var(--bad);
+        border-color: color-mix(in srgb, var(--bad) 45%, var(--line));
+      }
+      .tag.warn {
+        color: var(--warn);
+        border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 11px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 3px 8px;
+        border-bottom: 1px solid var(--line);
+        white-space: nowrap;
+      }
+      th {
+        color: var(--dim);
+        font-weight: 500;
+      }
+      td.num {
+        font-family: "Cascadia Mono", Consolas, monospace;
+      }
+      .bar {
+        height: 6px;
+        border-radius: 3px;
+        background: var(--inset);
+        overflow: hidden;
+        border: 1px solid var(--line);
+      }
+      .bar > i {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: var(--accent);
+        transition: width 180ms ease;
+      }
+      .cfglist { display: flex; flex-direction: column; gap: 6px; }
+      .cfgrow {
+        display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+        border: 1px solid var(--border); border-radius: var(--radius-md);
+        background: var(--bg-inset); cursor: pointer; transition: border-color 120ms ease;
+      }
+      .cfgrow:hover { border-color: var(--accent); }
+      .cfgrow.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+      .cfgrow .nm { font-weight: 600; font-family: var(--font-mono); }
+      .cfgrow .mt { color: var(--text-dim); font-size: var(--fs-xs); }
+      .cfgrow .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: 0 0 auto; }
+      .cfgrow.on .dot { background: var(--accent); }
+      .deliv { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+      .deliv .pill {
+        font-family: var(--font-mono); font-size: var(--fs-xs); padding: 3px 8px;
+        border: 1px solid var(--border); border-radius: var(--radius-pill); color: var(--text-dim);
+      }
+      #logwrap {
+        flex: 0 0 34%;
+        min-height: 90px;
+        display: flex;
+        flex-direction: column;
+        border-top: 1px solid var(--line);
+      }
+      #logbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 3px 10px;
+        font-size: 11px;
+        color: var(--dim);
+        border-bottom: 1px solid var(--line);
+        flex: 0 0 auto;
+      }
+      #log {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow: auto;
+        margin: 0;
+        padding: 4px 10px 10px;
+        font-family: "Cascadia Mono", Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--dim);
+        background: var(--inset);
+      }
+      #log .err {
+        color: var(--warn);
+      }
+      #log .sys {
+        color: var(--accent);
+      }
+      .note {
+        color: var(--faint);
+        font-size: 11px;
+        line-height: 1.6;
+        margin: 6px 0 0;
+      }
+      .banner {
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--line);
+        color: var(--warn);
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>YOLO 训练工作台</h1>
+      <span class="path" id="ws">（没有工作区）</span>
+      <span class="spacer"></span>
+      <span id="pystat" class="tag">python ?</span>
+      <button class="btn" id="reload" title="重新读工作区与配置">刷新</button>
+    </header>
+
+    <div id="nows" class="banner" hidden>
+      还没有登记工作区根。请关掉这个面板，在「扩展」面板顶部选一个目录（就是含 config.yaml 的那一个），再打开这里。
+    </div>
+
+    <div id="noconf" class="banner" hidden></div>
+
+    <nav>
+      <button data-tab="overview" class="on">概览</button>
+      <button data-tab="data">数据</button>
+      <button data-tab="train">训练</button>
+      <button data-tab="deploy">部署</button>
+    </nav>
+
+    <main>
+      <!-- ============ 概览 ============ -->
+      <section id="tab-overview">
+        <div class="card">
+          <h2>环境</h2>
+          <div class="kv" id="envkv"></div>
+          <div class="row" style="margin-top: 8px">
+            <button class="btn" id="probe">深度自检（torch / CUDA）</button>
+            <span class="note" style="margin: 0">要 import torch，第一遍通常 10~20 秒</span>
+          </div>
+          <div class="note" id="probenote"></div>
+        </div>
+
+        <div class="card">
+          <h2>数据集</h2>
+          <div class="kv" id="dskv"></div>
+        </div>
+
+        <div class="card">
+          <h2>部署工具</h2>
+          <div class="kv" id="depkv"></div>
+        </div>
+
+        <div class="card">
+          <h2>训练记录</h2>
+          <div id="runs"></div>
+        </div>
+      </section>
+
+      <!-- ============ 数据 ============ -->
+      <section id="tab-data" hidden>
+        <div class="card">
+          <h2>数据来源与划分</h2>
+          <div class="grid">
+            <label class="wide">
+              素材文件夹（一行一个：X-AnyLabeling 导出的 json + 图片混放目录）
+              <textarea id="sources" spellcheck="false" placeholder="D:/OneDrive/Desktop/X-AnyLabeling/images/123lmages"></textarea>
+            </label>
+            <label class="wide">
+              数据集输出目录
+              <input id="output_dir" spellcheck="false" />
+            </label>
+            <label>
+              验证集比例 val_ratio
+              <input id="val_ratio" type="number" step="0.01" min="0" max="0.9" />
+            </label>
+            <label>
+              随机种子 seed
+              <input id="seed" type="number" step="1" />
+            </label>
+            <label class="wide">
+              类别表 classes（一行一个，顺序即类别 id）
+              <textarea id="classes" spellcheck="false"></textarea>
+            </label>
+          </div>
+          <div class="row" style="margin-top: 10px">
+            <button class="btn primary" id="build">构建数据集</button>
+            <button class="btn" id="savedata">保存这些设置</button>
+            <span class="note" style="margin: 0">约 1 分钟；重复运行只更新有变化的文件</span>
+          </div>
+        </div>
+        <p class="note">
+          这里只改**本次运行**的参数。工作区里的 <code>config.yaml</code> 不会被改写——它是你自己的
+          基准，插件每次把它读出来当底、再叠上这里的改动，写到 <code>.uartix/yolo/runs/&lt;job&gt;/config.yaml</code>。
+        </p>
+      </section>
+
+      <!-- ============ 部署 ============ -->
+      <section id="tab-deploy" hidden>
+        <div class="card">
+          <h2>部署工具</h2>
+          <div class="kv" id="toolkv"></div>
+          <div class="note" id="toolnote"></div>
+        </div>
+
+        <div class="card">
+          <h2>模型</h2>
+          <div class="kv" id="modelkv"></div>
+          <div class="row" style="margin-top: 10px">
+            <button class="btn" id="deliver">交到 models/delivered</button>
+            <span class="note" style="margin: 0">把最新一次训练的 best.pt 复制一份出来（部署用它，训练产物不会被改动）</span>
+          </div>
+          <div class="deliv" id="delivlist"></div>
+        </div>
+
+        <div class="card">
+          <h2>配置与执行</h2>
+          <div class="cfglist" id="cfglist"></div>
+          <div class="row" style="margin-top: 12px; flex-wrap: wrap">
+            <button class="btn" id="dep-validate" title="只检查环境与配置，不动任何文件">只检查环境</button>
+            <button class="btn primary" id="dep-all">开始部署（全流程）</button>
+            <button class="btn" id="dep-convert" title="从 work/ 里已有的 ONNX 直接编译">只编译</button>
+            <button class="btn" id="dep-package" title="只重新生成 .mud 与例程">只打包</button>
+            <button class="btn" id="dep-stop">停止</button>
+          </div>
+          <p class="note">
+            插件**不改你那份 <code>deploy_config.*.ps1</code>**：它在
+            <code>.uartix/yolo/deploy/</code> 里生成一份包装配置（先读你的，再覆盖
+            <code>$Model</code> / <code>$ModelName</code>），把包装文件传给工具。跑完的日志和训练共用下面那一栏。
+          </p>
+        </div>
+      </section>
+
+      <!-- ============ 训练 ============ -->
+      <section id="tab-train" hidden>
+        <div class="card">
+          <h2>训练参数</h2>
+          <div class="grid">
+            <label class="wide">
+              预训练权重 weights
+              <input id="weights" spellcheck="false" />
+            </label>
+            <label>
+              轮次 epochs
+              <input id="epochs" type="number" step="1" min="1" />
+            </label>
+            <label>
+              分辨率 imgsz
+              <input id="imgsz" type="number" step="32" min="64" />
+            </label>
+            <label>
+              批大小 batch
+              <input id="batch" type="number" step="1" min="1" />
+            </label>
+            <label>
+              设备 device（0=GPU，cpu=CPU）
+              <input id="device" />
+            </label>
+            <label>
+              实验名 name
+              <input id="name" />
+            </label>
+            <label>
+              早停 patience
+              <input id="patience" type="number" step="1" min="1" />
+            </label>
+            <label>
+              数据加载进程 workers
+              <input id="workers" type="number" step="1" min="0" />
+            </label>
+          </div>
+          <p class="note">
+            workers 在这台 16G 内存的机器上必须保持 0（多进程加载器会把内存撑爆）。
+            fliplr / flipud 固定为 0：数字识别不做镜像。要改这两条请直接改
+            <code>.uartix/yolo/config.json</code>——面板不提供入口，因为它们几乎总是错的。
+          </p>
+          <div class="row" style="margin-top: 10px">
+            <button class="btn primary" id="train">开始训练</button>
+            <button class="btn danger" id="stop" disabled>停止</button>
+            <button class="btn" id="savetrain">保存这些设置</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>进度</h2>
+          <div class="bar"><i id="bar"></i></div>
+          <div class="kv" id="jobkv" style="margin-top: 8px"></div>
+        </div>
+      </section>
+    </main>
+
+    <div id="logwrap">
+      <div id="logbar">
+        <span>日志</span>
+        <span id="logmeta" class="tag"></span>
+        <span class="spacer"></span>
+        <button class="btn" id="copylog">复制全部</button>
+        <button class="btn" id="clearlog">清屏</button>
+      </div>
+      <pre id="log"></pre>
+    </div>
+
+    <script>
+      /* ---------------- 小工具 ---------------- */
+      var $ = function (id) {
+        return document.getElementById(id);
+      };
+      function esc(s) {
+        return String(s == null ? "" : s);
+      }
+      function num(id, def) {
+        var v = $(id).value.trim();
+        if (v === "") return def;
+        var n = Number(v);
+        return isFinite(n) ? n : def;
+      }
+      function lines(text) {
+        return text
+          .split(/\r?\n/)
+          .map(function (s) {
+            return s.trim();
+          })
+          .filter(Boolean);
+      }
+      var toast = $("log");
+
+      /* ---------------- 日志 ---------------- */
+      var LOG_MAX = 3000;
+      function appendLog(batch) {
+        var frag = document.createDocumentFragment();
+        for (var i = 0; i < batch.length; i++) {
+          var l = batch[i];
+          var div = document.createElement("div");
+          div.className = l.stream === "err" ? "err" : l.stream === "sys" ? "sys" : "";
+          div.textContent = l.text;
+          frag.appendChild(div);
+        }
+        var near = toast.scrollHeight - toast.scrollTop - toast.clientHeight < 40;
+        toast.appendChild(frag);
+        while (toast.childNodes.length > LOG_MAX) toast.removeChild(toast.firstChild);
+        if (near) toast.scrollTop = toast.scrollHeight;
+      }
+      function sysLog(text) {
+        appendLog([{ text: "[面板] " + text, stream: "sys" }]);
+      }
+
+      /* ---------------- 状态 ---------------- */
+      var st = null;
+      var running = null;
+
+      function fill(id, v) {
+        if ($(id) && document.activeElement !== $(id)) $(id).value = v == null ? "" : String(v);
+      }
+
+      function renderEnv() {
+        var py = st.python || {};
+        var cfg = st.config || {};
+        var eff = cfg.effective || {};
+        var env = eff.env || {};
+        $("ws").textContent = st.workspace || "（没有工作区）";
+        $("nows").hidden = !st.needWorkspace;
+
+        /* 工作区选错的典型形态：选到了上层目录（那里没有 config.yaml），
+           于是"参数全用内置默认、数据集空的" —— 看起来像插件坏了。这条横幅专治它。 */
+        var nc = $("noconf");
+        var noConf = !st.needWorkspace && cfg && !cfg.baseFound;
+        nc.hidden = !noConf;
+        if (noConf) {
+          nc.textContent =
+            "这个工作区里没有 config.yaml（" +
+            st.workspace +
+            "）。工作区根要选含 config.yaml 的那一层——通常是 D:\\YOLO-Workspace 这一级；" +
+            "现在面板用的是内置默认参数，数据集路径多半也是错的。";
+        }
+
+        var pyTag = $("pystat");
+        pyTag.className = "tag " + (py.ok ? "ok" : "bad");
+        pyTag.textContent = py.ok ? "python " + (py.version || "").replace(/^Python\s*/i, "") : "python 未就绪";
+        pyTag.title = (py.path || "") + (py.source ? "（来自 " + py.source + "）" : "");
+
+        $("envkv").innerHTML =
+          '<b>python</b><span>' +
+          esc(py.path || "(未找到)") +
+          "  " +
+          esc(py.ok ? "" : py.error) +
+          "</span>" +
+          "<b>来源</b><span>" +
+          esc(py.source || "-") +
+          "（改 _env.bat 或面板里的 env.python）</span>" +
+          "<b>config.yaml</b><span>" +
+          esc(cfg.baseFound ? "已读取（作为基准）" : cfg.baseError || "没找到，用内置默认") +
+          "</span>" +
+          "<b>代理</b><span>" +
+          esc(env.proxy_enable ? env.proxy || "(空)" : "关闭") +
+          "</span>";
+      }
+
+      /**
+       * 部署工具（`$EXT:deploy`）。
+       *
+       * 路径不写死在插件里：用户在「插件」面板给它绑一次，宿主经 ctx.root("deploy") 递进来。
+       * 没绑就直说"去绑一下"，而不是让这块显示成"坏了"。
+       */
+      function renderDeploy() {
+        var d = st.deploy || {};
+        if (!d.bound) {
+          $("depkv").innerHTML =
+            '<b>状态</b><span><span class="tag warn">还没配置</span></span>' +
+            '<b>怎么配</b><span>到「插件」面板顶部的「外部目录 deploy」里选一次 maixcam2_deploy 目录</span>';
+          return;
+        }
+        $("depkv").innerHTML =
+          '<b>目录</b><span>' +
+          esc(d.dir) +
+          "</span>" +
+          "<b>run.bat</b><span>" +
+          (d.runBat ? '<span class="tag ok">在</span>' : '<span class="tag warn">没找到</span>') +
+          "</span>" +
+          "<b>配置</b><span>" +
+          esc((d.configs || []).join(" / ") || "(没有 deploy_config*.ps1)") +
+          "</span>" +
+          "<b>可否部署</b><span>" +
+          (d.ready ? '<span class="tag ok">可以</span>' : '<span class="tag warn">还不行</span>') +
+          "</span>" +
+          (d.error ? "<b>读取失败</b><span>" + esc(d.error) + "</span>" : "");
+      }
+
+      /* ---------------- 部署 ---------------- */
+
+      var dep = { cfg: "", state: null };
+
+      function fmtBytes(n) {
+        if (!n) return "0 B";
+        if (n > 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+        if (n > 1024) return (n / 1024).toFixed(0) + " KB";
+        return n + " B";
+      }
+
+      function fmtAgo(ms) {
+        if (!ms) return "";
+        var d = Math.floor((Date.now() - ms) / 1000);
+        if (d < 60) return d + " 秒前";
+        if (d < 3600) return Math.floor(d / 60) + " 分钟前";
+        if (d < 86400) return Math.floor(d / 3600) + " 小时前";
+        return Math.floor(d / 86400) + " 天前";
+      }
+
+      async function loadDeploy() {
+        try {
+          dep.state = await uartix.call("deployState");
+        } catch (e) {
+          dep.state = { error: String((e && e.message) || e) };
+        }
+        renderDeployPage();
+      }
+
+      function renderDeployPage() {
+        var st2 = dep.state || {};
+        var tool = st2.tool || {};
+        var configs = st2.configs || [];
+
+        // 工具
+        if (!tool.bound) {
+          $("toolkv").innerHTML =
+            '<b>状态</b><span><span class="tag warn">还没配置</span></span>' +
+            "<b>怎么配</b><span>到「插件」面板顶部的「外部目录 deploy」里选一次 maixcam2_deploy 目录</span>";
+          $("toolnote").textContent = "没有部署工具也能训练；这一页只是暂时用不了。";
+        } else {
+          $("toolkv").innerHTML =
+            "<b>目录</b><span>" + esc(tool.dir) + "</span>" +
+            "<b>run.bat</b><span>" + (tool.runBat ? '<span class="tag ok">在</span>' : '<span class="tag warn">没找到</span>') + "</span>" +
+            "<b>配置文件</b><span>" + esc((tool.configs || []).join(" / ") || "(没有)") + "</span>" +
+            "<b>可否部署</b><span>" + (tool.ready ? '<span class="tag ok">可以</span>' : '<span class="tag warn">还不行</span>') + "</span>" +
+            (tool.error ? "<b>读取失败</b><span>" + esc(tool.error) + "</span>" : "");
+          $("toolnote").textContent = tool.ready
+            ? ""
+            : "工具目录里缺 run.bat 或 deploy_config*.ps1——插件不猜路径，缺什么就说什么。";
+        }
+
+        // 模型
+        var latest = st2.latest;
+        $("modelkv").innerHTML = latest
+          ? '<b>最新训练产物</b><span>' + esc(latest.path) + "</span>" +
+            "<b>来自</b><span>" + esc(latest.run) + " · " + fmtAgo(latest.at) + "</span>"
+          : '<b>最新训练产物</b><span><span class="tag warn">还没有</span> 先在上面把训练跑起来</span>';
+        $("deliver").disabled = !latest;
+        var dl = st2.delivered || [];
+        $("delivlist").innerHTML = dl.length
+          ? dl.map(function (d) {
+              return '<span class="pill" title="' + esc(fmtBytes(d.bytes)) + '">' + esc(d.name) + "</span>";
+            }).join("")
+          : '<span class="note" style="margin:0">还没交付过模型</span>';
+
+        // 配置列表
+        if (!configs.length) {
+          $("cfglist").innerHTML = '<div class="note" style="margin:0">没有可用的配置文件。</div>';
+        } else {
+          if (!dep.cfg || !configs.some(function (c) { return c.name === dep.cfg; })) dep.cfg = configs[0].name;
+          $("cfglist").innerHTML = configs.map(function (c) {
+            var on = c.name === dep.cfg;
+            return (
+              '<div class="cfgrow' + (on ? " on" : "") + '" data-cfg="' + esc(c.name) + '">' +
+                '<span class="dot"></span>' +
+                '<span class="nm">' + esc(c.name) + "</span>" +
+                '<span class="mt">' + esc(c.modelName || "(无 $ModelName)") + " · " + esc(c.imgsz) + " · " + esc(c.docker || "-") + "</span>" +
+                '<span style="flex:1 1 auto"></span>' +
+                (c.ok === false ? '<span class="tag warn">' + esc(c.error || "读不出") + "</span>" : "") +
+              "</div>"
+            );
+          }).join("");
+          var rows = $("cfglist").querySelectorAll(".cfgrow");
+          for (var i = 0; i < rows.length; i++) {
+            rows[i].onclick = function () {
+              dep.cfg = this.getAttribute("data-cfg");
+              renderDeployPage();
+            };
+          }
+        }
+
+        var running = !!(st2.active && st2.active.state === "running");
+        ["dep-validate", "dep-all", "dep-convert", "dep-package", "deliver"].forEach(function (id) {
+          var el = $(id);
+          if (el) el.disabled = running || (id !== "deliver" && !tool.ready);
+        });
+      }
+
+      async function runDeploy(step) {
+        if (!dep.cfg) return;
+        sysLog("部署开始（" + step + "）：" + dep.cfg);
+        try {
+          var job = await uartix.call("deployStart", dep.cfg, step, { deliver: step !== "validate" });
+          renderJob(job);
+        } catch (e) {
+          sysLog("[错误] " + String((e && e.message) || e));
+        }
+        loadDeploy();
+      }
+
+      $("deliver").onclick = async function () {
+        try {
+          var r = await uartix.call("deployDeliver", "");
+          sysLog("已交付：" + r.path);
+          dep.state = r.state;
+          renderDeployPage();
+        } catch (e) {
+          sysLog("[错误] " + String((e && e.message) || e));
+        }
+      };
+      $("dep-validate").onclick = function () { runDeploy("validate"); };
+      $("dep-all").onclick = function () { runDeploy("all"); };
+      $("dep-convert").onclick = function () { runDeploy("convert"); };
+      $("dep-package").onclick = function () { runDeploy("package"); };
+      $("dep-stop").onclick = async function () {
+        try { await uartix.call("stop"); } catch (e) { /* 没在跑 */ }
+      };
+
+      function renderDataset() {
+        var d = st.dataset || {};
+        var eff = st.config.effective || {};
+        var ds = eff.dataset || {};
+        $("dskv").innerHTML =
+          '<b>输出目录</b><span>' +
+          esc(d.dir || "-") +
+          "</span>" +
+          "<b>data.yaml</b><span>" +
+          (d.exists ? '<span class="tag ok">已就绪</span>' : '<span class="tag warn">还没构建</span>') +
+          "  train " +
+          (d.trainCount || 0) +
+          " 张 / val " +
+          (d.valCount || 0) +
+          " 张</span>" +
+          "<b>类别</b><span>" +
+          esc((d.classes && d.classes.length ? d.classes : ds.classes || []).join(" / ") || "-") +
+          "</span>" +
+          "<b>素材来源</b><span>" +
+          esc((ds.sources || []).length ? (ds.sources || []).join("  ·  ") : "(还没填)") +
+          "</span>";
+
+        fill("sources", (ds.sources || []).join("\n"));
+        fill("output_dir", ds.output_dir || "");
+        fill("val_ratio", ds.val_ratio);
+        fill("seed", ds.seed);
+        fill("classes", (ds.classes || []).join("\n"));
+      }
+
+      function renderRuns() {
+        var runs = st.runs || [];
+        if (!runs.length) {
+          $("runs").innerHTML = '<span class="note">还没有训练记录（runs/*/results.csv）</span>';
+          return;
+        }
+        var h =
+          "<table><thead><tr><th>实验</th><th>轮次</th><th>mAP50(M)</th><th>mAP50-95(M)</th><th>best.pt</th></tr></thead><tbody>";
+        for (var i = 0; i < runs.length; i++) {
+          var r = runs[i];
+          var m = r.metrics || {};
+          var f = function (x) {
+            var n = Number(x);
+            return isFinite(n) ? n.toFixed(4) : "-";
+          };
+          h +=
+            "<tr><td>" +
+            esc(r.name) +
+            '</td><td class="num">' +
+            r.epochs +
+            '</td><td class="num">' +
+            f(m.mAP50M) +
+            '</td><td class="num">' +
+            f(m.mAP5095M) +
+            "</td><td>" +
+            (r.hasBest ? '<span class="tag ok">有</span>' : '<span class="tag">无</span>') +
+            "</td></tr>";
+        }
+        $("runs").innerHTML = h + "</tbody></table>";
+      }
+
+      function renderTrainParams() {
+        var t = (st.config.effective || {}).train || {};
+        fill("weights", t.weights);
+        fill("epochs", t.epochs);
+        fill("imgsz", t.imgsz);
+        fill("batch", t.batch);
+        fill("device", t.device);
+        fill("name", t.name);
+        fill("patience", t.patience);
+        fill("workers", t.workers);
+      }
+
+      function renderJob(j) {
+        running = j && j.state === "running" ? j : null;
+        $("stop").disabled = !running;
+        $("train").disabled = !!running;
+        $("build").disabled = !!running;
+        var p = (j && j.progress) || {};
+        $("bar").style.width = (p.percent || 0) + "%";
+        $("bar").style.background = p.phase === "error" ? "var(--bad)" : "var(--accent)";
+        $("jobkv").innerHTML = j
+          ? "<b>状态</b><span>" +
+            esc(j.label) +
+            " · " +
+            esc(j.state) +
+            (j.code != null ? "（退出码 " + j.code + "）" : "") +
+            "</span>" +
+            "<b>阶段</b><span>" +
+            esc(p.phase || "-") +
+            "</span>" +
+            "<b>进度</b><span>" +
+            (p.percent || 0) +
+            "%  " +
+            esc(p.detail || "") +
+            "</span>" +
+            "<b>日志文件</b><span>" +
+            esc(j.logPath || "-") +
+            "</span>"
+          : '<span class="note">还没有跑过任务</span>';
+      }
+
+      function renderAll(s) {
+        st = s;
+        renderEnv();
+        renderDataset();
+        renderDeploy();
+        renderRuns();
+        renderTrainParams();
+        renderJob(s.active || (s.jobs && s.jobs.length ? s.jobs[s.jobs.length - 1] : null));
+      }
+
+      async function refresh(quiet) {
+        try {
+          var s = await uartix.call("state");
+          renderAll(s);
+          if (!quiet) sysLog("已刷新");
+        } catch (e) {
+          sysLog("读状态失败：" + (e && e.message ? e.message : e));
+        }
+      }
+
+      /* ---------------- 表单 → patch ---------------- */
+      async function save(kind) {
+        var patch = {};
+        if (kind === "data") {
+          patch.dataset = {
+            sources: lines($("sources").value),
+            output_dir: $("output_dir").value.trim(),
+            val_ratio: num("val_ratio", 0.15),
+            seed: num("seed", 42),
+            classes: lines($("classes").value),
+          };
+        } else {
+          patch.train = {
+            weights: $("weights").value.trim(),
+            epochs: num("epochs", 300),
+            imgsz: num("imgsz", 640),
+            batch: num("batch", 16),
+            device: $("device").value.trim(),
+            name: $("name").value.trim(),
+            patience: num("patience", 100),
+            workers: num("workers", 0),
+          };
+        }
+        try {
+          var s = await uartix.call("saveConfig", patch);
+          renderAll(s);
+          sysLog("设置已保存（写到 .uartix/yolo/config.json）");
+        } catch (e) {
+          sysLog("保存失败：" + (e && e.message ? e.message : e));
+        }
+      }
+
+      async function startJob(kind) {
+        try {
+          sysLog(kind === "data" ? "开始构建数据集…" : "开始训练…");
+          await save(kind === "data" ? "data" : "train");
+          var j = await uartix.call(kind === "data" ? "startDataset" : "startTrain", {});
+          toast.innerHTML = "";
+          renderJob(j);
+        } catch (e) {
+          sysLog("启动失败：" + (e && e.message ? e.message : e));
+        }
+      }
+
+      /* ---------------- 事件 ---------------- */
+      uartix.on("log", function (p) {
+        if (p && p.lines) appendLog(p.lines);
+      });
+      uartix.on("job", function (j) {
+        if (!j) return;
+        if (j.kind === "deploy") loadDeploy();
+        renderJob(j);
+        if (j.state !== "running" && !j._doneShown) {
+          j._doneShown = true;
+          sysLog(j.label + "：" + (j.state === "succeeded" ? "完成" : "失败（退出码 " + j.code + "）"));
+          refresh(true);
+        }
+      });
+
+      /* ---------------- 按钮 ---------------- */
+      var tabs = document.querySelectorAll("nav button");
+      for (var i = 0; i < tabs.length; i++) {
+        tabs[i].onclick = function () {
+          var name = this.getAttribute("data-tab");
+          if (name === "deploy") loadDeploy();
+          for (var k = 0; k < tabs.length; k++) tabs[k].className = tabs[k].getAttribute("data-tab") === name ? "on" : "";
+          $("tab-overview").hidden = name !== "overview";
+          $("tab-data").hidden = name !== "data";
+          $("tab-train").hidden = name !== "train";
+        };
+      }
+      $("reload").onclick = function () {
+        refresh(false);
+      };
+      $("savedata").onclick = function () {
+        save("data");
+      };
+      $("savetrain").onclick = function () {
+        save("train");
+      };
+      $("build").onclick = function () {
+        startJob("data");
+      };
+      $("train").onclick = function () {
+        startJob("train");
+      };
+      $("stop").onclick = async function () {
+        try {
+          await uartix.call("stop");
+          sysLog("已请求停止");
+        } catch (e) {
+          sysLog("停止失败：" + (e && e.message ? e.message : e));
+        }
+      };
+      $("probe").onclick = async function () {
+        $("probenote").textContent = "自检中…（要 import torch）";
+        try {
+          var r = await uartix.call("probe");
+          $("probenote").textContent = r.ok
+            ? "python " +
+              r.python +
+              " · torch " +
+              (r.torch || ("✗ " + (r.torch_error || ""))) +
+              " · CUDA " +
+              (r.cuda ? r.gpu || "可用" : "不可用") +
+              " · ultralytics " +
+              (r.ultralytics || ("✗ " + (r.ultralytics_error || "")))
+            : "自检失败：" + r.error;
+        } catch (e) {
+          $("probenote").textContent = "自检失败：" + (e && e.message ? e.message : e);
+        }
+      };
+      $("clearlog").onclick = function () {
+        toast.innerHTML = "";
+      };
+      $("copylog").onclick = function () {
+        var t = toast.innerText || "";
+        if (navigator.clipboard) navigator.clipboard.writeText(t).then(null, function () {});
+      };
+
+      /* ---------------- 启动 ---------------- */
+      refresh(true);
+    </script>
+  </body>
+</html>
