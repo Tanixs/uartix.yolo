@@ -81,7 +81,7 @@ const DEFAULTS = {
 /* ============================ 基础设施 ============================ */
 
 let ctx = null;
-/** 工作区根（`$WS`）。空串说明用户没在插件面板里登记，所有操作直接给出人话错误。 */
+/** 工作区根（`$WS`）。空串说明用户没在扩展面板里登记，所有操作直接给出人话错误。 */
 let root = "";
 
 const jobs = new Map();
@@ -89,7 +89,7 @@ let seq = 0;
 let active = null;
 
 function needWorkspace() {
-  if (!root) throw new Error("还没登记工作区根：点面板上的「选择工作区…」，或在 设置 → 插件 顶部选一个目录（就是含 config.yaml 的那个）");
+  if (!root) throw new Error("还没登记工作区根：请在「扩展」面板顶部选一个目录（就是含 config.yaml 的那个）");
   return root;
 }
 
