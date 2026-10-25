@@ -81,7 +81,7 @@ const DEFAULTS = {
 /* ============================ 基础设施 ============================ */
 
 let ctx = null;
-/** 工作区根（`$WS`）。空串说明用户没在扩展面板里登记，所有操作直接给出人话错误。 */
+/** 工作区根（`$WS`）。空串说明用户没在插件面板里登记，所有操作直接给出人话错误。 */
 let root = "";
 
 const jobs = new Map();
@@ -89,7 +89,7 @@ let seq = 0;
 let active = null;
 
 function needWorkspace() {
-  if (!root) throw new Error("还没登记工作区根：请在「扩展」面板顶部选一个目录（就是含 config.yaml 的那个）");
+  if (!root) throw new Error("还没登记工作区根：点面板上的「选择工作区…」，或在 设置 → 插件 顶部选一个目录（就是含 config.yaml 的那个）");
   return root;
 }
 
@@ -414,6 +414,18 @@ function scanDataset(dirIn) {
   };
 }
 
+/** 秒数 → 人能读的时长。0 / 缺失返回空串，界面自己决定显示成「—」。 */
+function fmtDuration(sec) {
+  var n = Math.round(Number(sec) || 0);
+  if (n <= 0) return "";
+  var h = Math.floor(n / 3600);
+  var m = Math.floor((n % 3600) / 60);
+  var s = n % 60;
+  if (h) return h + "h " + String(m).padStart(2, "0") + "m";
+  if (m) return m + "m " + String(s).padStart(2, "0") + "s";
+  return s + "s";
+}
+
 /** 训练记录：`<project>/<name>/results.csv` 的最后一行就是这一轮的最新指标。 */
 function scanRuns(project) {
   const dir = project || abs(DEFAULTS.train.project);
@@ -453,6 +465,9 @@ function scanRuns(project) {
     } catch {
       /* ignore */
     }
+    // ultralytics 的 results.csv 有一列累计秒数 `time`；老记录没有这一列就留空。
+    const elapsed = last ? Number(last.time) : 0;
+    const durationSec = Number.isFinite(elapsed) && elapsed > 0 ? elapsed : 0;
     runs.push({
       name,
       dir: d.replace(/\\/g, "/"),
@@ -460,6 +475,11 @@ function scanRuns(project) {
       hasBest: fs.existsSync(best),
       best: best.replace(/\\/g, "/"),
       mtime,
+      durationSec,
+      durationText: fmtDuration(durationSec),
+      // CSV 的 mtime 就是最后一次写入的时刻；有累计时长时一并给出起点，界面拿去做 tooltip。
+      finishedAt: mtime,
+      startedAt: durationSec > 0 && mtime > 0 ? Math.round(mtime - durationSec * 1000) : 0,
       metrics: last
         ? {
             mAP50M: last["metrics/mAP50(M)"] || last["metrics/mAP50(B)"] || "",
@@ -1191,4 +1211,4 @@ async function activate(c) {
 
 // `dumpConfig` / `parseSimpleYaml` 是纯函数（不碰 ctx），导出给测试与将来的复用：
 // 它们之间必须能往返——本插件生成的 config.yaml，用它自己的解析器读回来必须一模一样。
-export { activate, dumpConfig, parseSimpleYaml };
+export { activate, dumpConfig, fmtDuration, parseSimpleYaml };
