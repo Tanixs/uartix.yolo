@@ -329,9 +329,7 @@
     </header>
 
     <div id="nows" class="banner" hidden>
-      还没有登记工作区根。
-      <button class="btn" id="pickws" title="选完还要在 设置 → 插件 的「目录绑定」里确认">选择工作区…</button>
-      <span style="opacity: .65">就是含 config.yaml 的那一个目录；确认后回这里点「刷新」。</span>
+      还没有登记工作区根。请关掉这个面板，在「扩展」面板顶部选一个目录（就是含 config.yaml 的那一个），再打开这里。
     </div>
 
     <div id="noconf" class="banner" hidden></div>
@@ -959,21 +957,12 @@
           $("tab-overview").hidden = name !== "overview";
           $("tab-data").hidden = name !== "data";
           $("tab-train").hidden = name !== "train";
+          /* R16：部署是第四块 section，这里原来只切三块——点了「部署」什么都不显示。 */
+          $("tab-deploy").hidden = name !== "deploy";
         };
       }
       $("reload").onclick = function () {
         refresh(false);
-      };
-      /* 选工作区：宿主弹系统对话框由用户选，选完还要在「设置 → 插件」的目录绑定里确认。
-         这条按钮只是把用户已经选好的东西送到那一步，不是插件自己给自己授权。 */
-      $("pickws").onclick = async function () {
-        try {
-          var r = await uartix.bindRoot("$WS");
-          if (!r) return;
-          sysLog("已选择 " + r.path + "：请到 设置 → 插件 的「目录绑定」里确认，然后点「刷新」");
-        } catch (e) {
-          sysLog("登记工作区失败：" + (e && e.message ? e.message : e));
-        }
       };
       $("savedata").onclick = function () {
         save("data");
