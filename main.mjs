@@ -40,6 +40,7 @@
  */
 
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -72,6 +73,21 @@ const INTAKE_DIR = "annotations";
 const PY_ENV = { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1", YOLO_AUTOINSTALL: "false" };
 /** 内存里保留多少行日志。界面上限一致，超出丢最旧的。 */
 const LOG_KEEP = 4000;
+
+/** P177-A：资产索引、run 记录、路径偏好（都在已有写权限目录内）。 */
+const CATALOG_FILE = `${RUNS_DIR}/catalog.json`;
+const RUN_META_DIR = `${RUNS_DIR}/runs`;
+const PREFS_FILE = `${STATE_DIR}/prefs.json`;
+const TRASH_DIR = `${STATE_DIR}/trash`;
+const RECENT_MAX = 12;
+const RECENT_FIELDS = ["weights", "data", "output_dir", "sources", "calib", "deploy"];
+const PLUGIN_VERSION = (() => {
+  try {
+    return String(JSON.parse(fs.readFileSync(path.join(PKG_DIR, "plugin.json"), "utf8")).version || "");
+  } catch {
+    return "";
+  }
+})();
 
 /**
  * 内置默认 = 这台机器上验证过的一套（来自工作区的 config.yaml + README 第四节）。
@@ -471,6 +487,941 @@ function readJson(file, fallback) {
 
 function isObj(v) {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/* ============================ P177-A 资产地基 ============================ */
+
+function canWrite() {
+  return !!root && probeCage().ok;
+}
+
+/** catalog/prefs/run 记录都走这一条：临时文件 + rename，Windows 上 rename 失败就退回复制。 */
+function writeJsonAtomic(file, obj) {
+  if (!canWrite()) return false;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = file + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), "utf8");
+    try {
+      fs.renameSync(tmp, file);
+    } catch {
+      fs.copyFileSync(tmp, file);
+      fs.rmSync(tmp, { force: true });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const fileHashCache = new Map();
+function sha256File(file) {
+  try {
+    const st = fs.statSync(file);
+    const key = `${file}|${st.size}|${st.mtimeMs}`;
+    const hit = fileHashCache.get(key);
+    if (hit) return hit;
+    const h = createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+    fileHashCache.set(key, h);
+    return h;
+  } catch {
+    return "";
+  }
+}
+
+/** 目录体积/文件数/最新 mtime；只 stat，不读内容。 */
+function walkStats(dir) {
+  let bytes = 0;
+  let files = 0;
+  let newest = 0;
+  const walk = (d) => {
+    let ents;
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(p);
+        continue;
+      }
+      try {
+        const st = fs.statSync(p);
+        bytes += st.size;
+        files += 1;
+        if (st.mtimeMs > newest) newest = st.mtimeMs;
+      } catch {
+        /* 文件刚被删 */
+      }
+    }
+  };
+  walk(dir);
+  return { bytes, files, newest };
+}
+
+/** 数据集里的非标准附加物（origin / origin_json_backup / zip / 嵌套 images…）。 */
+function datasetExtras(dir) {
+  const allowed = new Set(["images", "labels", "data.yaml"]);
+  const out = [];
+  let ents;
+  try {
+    ents = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of ents) {
+    if (allowed.has(e.name)) continue;
+    const p = path.join(dir, e.name);
+    const st = walkStats(p);
+    out.push({ name: e.name, kind: e.isDirectory() ? "dir" : "file", bytes: st.bytes, files: st.files });
+  }
+  return out;
+}
+
+/**
+ * 数据集快速指纹：data.yaml + 类别 + 划分 + 图片/标签总字节 + 最新 mtime。
+ * 不读 44GB 内容；内容变了 mtime/字节通常会变。完整哈希是后续“冻结”动作的事。
+ */
+function datasetFingerprintFor(dirIn, dsIn) {
+  const dir = abs(dirIn || DEFAULTS.dataset.output_dir);
+  const ds = dsIn || scanDataset(dir);
+  const img = walkStats(path.join(dir, "images"));
+  const lab = walkStats(path.join(dir, "labels"));
+  let yaml = "";
+  try {
+    yaml = fs.readFileSync(path.join(dir, "data.yaml"), "utf8");
+  } catch {
+    /* 没 data.yaml 也给它一个指纹，状态会标 incomplete */
+  }
+  const raw = JSON.stringify({
+    yaml,
+    classes: ds.classes || [],
+    train: ds.trainCount || 0,
+    val: ds.valCount || 0,
+    imgBytes: img.bytes,
+    labBytes: lab.bytes,
+    newest: Math.max(img.newest, lab.newest),
+  });
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+/* ---- run 记录（train_runs/runs/<run>.json） ---- */
+
+function safeRunName(name) {
+  return String(name == null ? "" : name)
+    .replace(/[^\w.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+function runMetaFile(name) {
+  return abs(`${RUN_META_DIR}/${safeRunName(name)}.json`);
+}
+function readRunMeta(name) {
+  if (!name) return null;
+  const v = readJson(runMetaFile(name), null);
+  return isObj(v) ? v : null;
+}
+function writeRunMeta(name, patch) {
+  if (!name || !canWrite()) return null;
+  const file = runMetaFile(name);
+  const prev = readJson(file, null);
+  const next = {
+    schemaVersion: 1,
+    run: String(name),
+    ...(isObj(prev) ? prev : {}),
+    ...(isObj(patch) ? patch : {}),
+    updatedAt: new Date().toISOString(),
+  };
+  writeJsonAtomic(file, next);
+  catalogCache.at = 0;
+  return next;
+}
+
+/** 插件重启时，把没有活进程的 running 记录标成 interrupted（只在可写时落盘）。 */
+function reconcileRunMeta() {
+  if (!root || !canWrite()) return;
+  let names = [];
+  try {
+    names = fs.readdirSync(abs(RUN_META_DIR)).filter((f) => f.endsWith(".json"));
+  } catch {
+    return;
+  }
+  for (const f of names) {
+    const meta = readJson(path.join(abs(RUN_META_DIR), f), null);
+    if (!isObj(meta) || meta.status !== "running") continue;
+    const run = String(meta.run || path.basename(f, ".json"));
+    const alive = [...jobs.values()].some((j) => j.runName === run && j.state === "running");
+    if (alive) continue;
+    writeRunMeta(run, {
+      status: "interrupted",
+      finishedAt: Date.now(),
+      reason: "插件重启时这个任务已经不在（没有活进程）",
+      artifacts: meta.artifacts || {},
+    });
+  }
+}
+
+const STATUS_LABEL = {
+  running: "运行中",
+  succeeded: "完成",
+  stopped: "已停止",
+  failed: "失败",
+  interrupted: "中断",
+  external: "外部 run",
+  incomplete: "不完整",
+};
+
+/**
+ * run 状态：插件自己启动的看 sidecar；手动 run 只做“外部/不完整”推断，不冒充中断。
+ * profile 来自 runProfile；meta 来自 train_runs/runs/<run>.json。
+ */
+function runStatusOf(name, profile, meta) {
+  const p = profile || {};
+  const m = meta || readRunMeta(name);
+  const managed = !!m;
+  if (m && m.status) {
+    let status = String(m.status);
+    let why = String(m.reason || "");
+    if (status === "running") {
+      const alive = [...jobs.values()].some((j) => j.runName === name && j.state === "running");
+      if (!alive) {
+        status = "interrupted";
+        why = why || "插件重启时这个任务已经不在（没有活进程）";
+      }
+    }
+    return { status, label: STATUS_LABEL[status] || status, why, managed };
+  }
+  if (!p.hasResultsCsv) return { status: "incomplete", label: STATUS_LABEL.incomplete, why: "没有 results.csv（引擎没写出训练记录）", managed: false };
+  if (!p.hasBest && !p.hasLast) return { status: "incomplete", label: STATUS_LABEL.incomplete, why: "没有 best.pt / last.pt（权重没落盘）", managed: false };
+  const early = Number(p.argsEpochs) > 0 && Number(p.epochs) > 0 && Number(p.epochs) < Number(p.argsEpochs);
+  return {
+    status: "external",
+    label: STATUS_LABEL.external,
+    why: early
+      ? `外部 run：配置 ${p.argsEpochs} 轮，实际 ${p.epochs} 轮（可能早停/中断，面板没有它的结束记录）`
+      : "外部 run：面板没有它的启动/结束记录（可能是手动流水线跑的）",
+    managed: false,
+  };
+}
+
+/* ---- 路径偏好 ---- */
+
+function readPrefs() {
+  const raw = readJson(abs(PREFS_FILE), null);
+  const recent = {};
+  for (const f of RECENT_FIELDS) {
+    const arr = raw && raw.recent && Array.isArray(raw.recent[f]) ? raw.recent[f] : [];
+    recent[f] = arr
+      .filter((x) => isObj(x) && typeof x.path === "string" && x.path.trim())
+      .map((x) => ({ ...x, path: x.path.replace(/\\/g, "/"), exists: !!x.exists }))
+      .slice(0, RECENT_MAX);
+  }
+  return {
+    schemaVersion: 1,
+    recent,
+    ...(isObj(raw) && raw.pinned ? { pinned: raw.pinned } : {}),
+    // 回收站保留策略：0 = 不自动清理（默认）。只影响"按策略清理"按钮，插件从不自己定时删。
+    trashKeepDays: Math.max(0, Number(raw && raw.trashKeepDays) || 0),
+  };
+}
+
+function savePrefs(prefs) {
+  return writeJsonAtomic(abs(PREFS_FILE), prefs);
+}
+
+/** 记一条最近路径；同一个解析后路径只留最新一条。 */
+function rememberPath(field, value, source) {
+  const f = String(field || "");
+  const v = String(value == null ? "" : value).trim().replace(/\\/g, "/");
+  if (!RECENT_FIELDS.includes(f) || !v || !canWrite()) return;
+  const prefs = readPrefs();
+  const key = abs(v).toLowerCase();
+  const old = prefs.recent[f] || [];
+  const rest = old.filter((x) => abs(String(x.path || "")).toLowerCase() !== key);
+  rest.unshift({ path: v, at: Date.now(), source: String(source || ""), exists: fs.existsSync(abs(v)) });
+  prefs.recent[f] = rest.slice(0, RECENT_MAX);
+  savePrefs(prefs);
+}
+
+function rememberConfigPaths(eff) {
+  if (!isObj(eff)) return;
+  const train = isObj(eff.train) ? eff.train : {};
+  const ds = isObj(eff.dataset) ? eff.dataset : {};
+  rememberPath("weights", train.weights, "config");
+  rememberPath("data", train.data || (ds.output_dir ? path.join(abs(ds.output_dir), "data.yaml") : ""), "config");
+  rememberPath("output_dir", ds.output_dir, "config");
+  for (const s of ds.sources || []) rememberPath("sources", s, "config");
+}
+
+/* ---- 资产索引 ---- */
+
+/* ---- P177-B 回收站 / 审计 / 引用检查 ---- */
+
+const AUDIT_FILE = `${STATE_DIR}/audit.jsonl`;
+
+function insidePath(parent, child) {
+  const p = path.resolve(String(parent || "")).toLowerCase();
+  const c = path.resolve(String(child || "")).toLowerCase();
+  return !!p && (c === p || c.startsWith(p + path.sep));
+}
+
+function ensureInside(parent, child, what) {
+  if (!insidePath(parent, child)) throw new Error(`${what}不在允许的目录里：${child}`);
+}
+
+function pathBytes(target) {
+  try {
+    const st = fs.statSync(target);
+    if (st.isDirectory()) return walkStats(target);
+    return { bytes: st.size, files: 1, newest: st.mtimeMs };
+  } catch {
+    return { bytes: 0, files: 0, newest: 0 };
+  }
+}
+
+function auditLog(entry) {
+  if (!canWrite()) return;
+  try {
+    fs.mkdirSync(abs(STATE_DIR), { recursive: true });
+    fs.appendFileSync(abs(AUDIT_FILE), JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n", "utf8");
+  } catch {
+    /* 审计写不动不挡动作本身 */
+  }
+}
+
+function readAudit(limit) {
+  let text = "";
+  try {
+    text = fs.readFileSync(abs(AUDIT_FILE), "utf8");
+  } catch {
+    return [];
+  }
+  return text
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-Math.max(1, limit || 40))
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .reverse();
+}
+
+/**
+ * 把目标移进回收站：同盘 rename；跨盘/被占用时退化为复制后删除。
+ * `.uartix/yolo/trash/<stamp>/<kind>/<id>/payload` 是原件，`.trash.json` 是账。
+ */
+function moveToTrash(target, meta) {
+  if (!canWrite()) throw new Error("当前是只读模式：能看资产，不能删除");
+  const full = path.resolve(String(target || ""));
+  const ws = path.resolve(root);
+  ensureInside(ws, full, "要回收的东西");
+  if (!fs.existsSync(full)) throw new Error(`文件已经不在：${full}`);
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14) + "-" + Math.random().toString(36).slice(2, 6);
+  const kind = String(meta.kind || "file").replace(/[^\w.-]+/g, "-");
+  const id = String(meta.id || path.basename(full)).replace(/[^\w.-]+/g, "-").slice(0, 80) || "item";
+  const entryDir = path.join(abs(TRASH_DIR), stamp, kind, id);
+  const dest = path.join(entryDir, "payload");
+  const st = pathBytes(full);
+  fs.mkdirSync(entryDir, { recursive: true });
+  try {
+    fs.renameSync(full, dest);
+  } catch {
+    // 跨盘或文件被占用：复制后删除。32G 数据集通常同盘，走不到这里。
+    fs.cpSync(full, dest, { recursive: true, force: true });
+    fs.rmSync(full, { recursive: true, force: true });
+  }
+  const record = {
+    schemaVersion: 1,
+    id: `${stamp}-${kind}-${id}`,
+    kind,
+    target: id,
+    name: String(meta.name || path.basename(full)),
+    originalPath: full.replace(/\\/g, "/"),
+    bytes: st.bytes,
+    files: st.files,
+    refs: isObj(meta.refs) ? meta.refs : {},
+    reason: String(meta.reason || ""),
+    cascade: !!meta.cascade,
+    deletedAt: new Date().toISOString(),
+    restoredAt: "",
+    entryDir: entryDir.replace(/\\/g, "/"),
+    payload: dest.replace(/\\/g, "/"),
+  };
+  writeJsonAtomic(path.join(entryDir, ".trash.json"), record);
+  auditLog({ action: "trash", kind: record.kind, id: record.id, path: record.originalPath, bytes: record.bytes, cascade: record.cascade });
+  return record;
+}
+
+/** 按保留策略清理回收站：**只在你点按钮时执行**，插件从不自己定时删。 */
+function purgeOldTrash(keepDays, confirm) {
+  if (!canWrite()) throw new Error("当前是只读模式：不能永久删除");
+  if (String(confirm || "") !== "清理过期") throw new Error("永久删除要二次确认：确认文本必须是「清理过期」");
+  const days = Math.max(0, Number(keepDays) || 0);
+  if (!days) throw new Error("保留策略是「不自动清理」：先把天数设成 30 或 90，再点清理");
+  const cut = Date.now() - days * 86400000;
+  const old = listTrash().filter((e) => e.at && e.at < cut);
+  let bytes = 0;
+  for (const e of old) {
+    try {
+      fs.rmSync(abs(e.dir), { recursive: true, force: true });
+      bytes += Number(e.bytes) || 0;
+      auditLog({ action: "purge", kind: e.kind, id: e.id, path: e.originalPath, bytes: e.bytes, reason: `超过 ${days} 天` });
+    } catch {
+      /* 一条失败继续下一条 */
+    }
+  }
+  return { ok: true, purged: old.length, bytes, keepDays: days };
+}
+
+function listTrash() {
+  const base = abs(TRASH_DIR);
+  const out = [];
+  const walk = (d, depth) => {
+    if (depth > 4) return;
+    let ents = [];
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isFile() && e.name === ".trash.json") {
+        const meta = readJson(p, null);
+        if (isObj(meta)) {
+          const st = pathBytes(p.replace(/\.trash\.json$/i, "") + path.sep + "payload");
+          out.push({
+            ...meta,
+            dir: String(meta.entryDir || path.dirname(p)).replace(/\\/g, "/"),
+            bytes: Number(meta.bytes) || st.bytes,
+            files: Number(meta.files) || st.files,
+            at: Date.parse(meta.deletedAt) || 0,
+          });
+        }
+        continue;
+      }
+      if (e.isDirectory()) walk(p, depth + 1);
+    }
+  };
+  walk(base, 0);
+  return out.sort((a, b) => b.at - a.at);
+}
+
+function restoreTrash(entryId) {
+  if (!canWrite()) throw new Error("当前是只读模式：能看回收站，不能恢复");
+  const entry = listTrash().find((x) => x.id === String(entryId || "") || x.dir === String(entryId || ""));
+  if (!entry) throw new Error(`回收站里没有这一条：${entryId}`);
+  const payload = abs(entry.payload);
+  const dest = abs(entry.originalPath);
+  if (!fs.existsSync(payload)) throw new Error("回收站里的原件已经不在，恢复不了");
+  if (fs.existsSync(dest)) throw new Error(`原路径还被占用：${entry.originalPath}。先把它挪开或改名，再恢复。`);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  try {
+    fs.renameSync(payload, dest);
+  } catch {
+    fs.cpSync(payload, dest, { recursive: true, force: true });
+    fs.rmSync(payload, { recursive: true, force: true });
+  }
+  const entryDir = path.dirname(payload);
+  try {
+    fs.rmSync(entryDir, { recursive: true, force: true });
+  } catch {
+    /* 账留下也不影响恢复结果 */
+  }
+  auditLog({ action: "restore", kind: entry.kind, id: entry.id, path: entry.originalPath, bytes: entry.bytes });
+  return { ok: true, restored: entry.originalPath, kind: entry.kind };
+}
+
+function purgeTrash(entryId) {
+  if (!canWrite()) throw new Error("当前是只读模式：不能永久删除");
+  const entry = listTrash().find((x) => x.id === String(entryId || "") || x.dir === String(entryId || ""));
+  if (!entry) throw new Error(`回收站里没有这一条：${entryId}`);
+  fs.rmSync(abs(entry.dir), { recursive: true, force: true });
+  auditLog({ action: "purge", kind: entry.kind, id: entry.id, path: entry.originalPath, bytes: entry.bytes });
+  return { ok: true, purged: entry.id, bytes: entry.bytes };
+}
+
+function purgeAllTrash(confirm) {
+  if (!canWrite()) throw new Error("当前是只读模式：不能清空回收站");
+  if (String(confirm || "") !== "清空") throw new Error("永久删除要二次确认：确认文本必须是「清空」");
+  const all = listTrash();
+  let bytes = 0;
+  for (const e of all) {
+    try {
+      fs.rmSync(abs(e.dir), { recursive: true, force: true });
+      bytes += Number(e.bytes) || 0;
+      auditLog({ action: "purge", kind: e.kind, id: e.id, path: e.originalPath, bytes: e.bytes });
+    } catch {
+      /* 一条失败继续清下一条 */
+    }
+  }
+  return { ok: true, purged: all.length, bytes };
+}
+
+/** 外部部署缓存只读统计：只 stat，不碰一个字节。 */
+let externalCacheCache = { at: 0, value: null };
+function externalCacheStats() {
+  if (!root) return null;
+  if (externalCacheCache.value && Date.now() - externalCacheCache.at < 10000) return externalCacheCache.value;
+  const tool = scanDeployTool();
+  if (!tool.bound) return { bound: false, dir: "", items: [], bytes: 0, cleanList: [] };
+  const items = [];
+  for (const name of ["work", "calib", "out", "deploy"]) {
+    const p = path.join(tool.dir, name);
+    const st = pathBytes(p);
+    if (st.bytes || fs.existsSync(p)) items.push({ name, path: p.replace(/\\/g, "/"), bytes: st.bytes, files: st.files });
+  }
+  const bytes = items.reduce((n, x) => n + x.bytes, 0);
+  const cleanList = items.map((x) => `# 手工清理（插件不执行）：${x.path}  ${(x.bytes / 1024 / 1024).toFixed(1)} MB`);
+  const value = { bound: true, dir: tool.dir, items, bytes, cleanList, readOnly: true };
+  externalCacheCache = { at: Date.now(), value };
+  return value;
+}
+
+/**
+ * 清理建议只读：每条都带证据（谁引用它、为什么建议），默认不勾选任何危险项。
+ * “早停”只作为 info 提示，不放进默认清理清单。
+ */
+function cleanupSuggestions(catalog, projectIn) {
+  const out = [];
+  const project = abs(projectIn || DEFAULTS.train.project);
+  const models = Object.values(catalog.models || {});
+  for (const m of models) {
+    if (!Array.isArray(m.paths) || m.paths.length < 2) continue;
+    const preferred =
+      m.paths.find((p) => !/object-object/i.test(p) && /\/delivered\//i.test(p)) ||
+      m.paths.find((p) => !/object-object/i.test(p)) ||
+      m.paths[0];
+    for (const p of m.paths) {
+      if (p === preferred) continue;
+      const st = pathBytes(p);
+      out.push({
+        kind: "model",
+        id: m.id,
+        name: path.basename(p),
+        path: p,
+        bytes: st.bytes,
+        reason: `同 SHA256 重复副本；保留 ${path.basename(preferred)}`,
+        refs: m.refs || {},
+        risk: "safe",
+        preset: false,
+      });
+    }
+  }
+  for (const r of Object.values(catalog.runs || {})) {
+    const args = Number(r.argsEpochs) || 0;
+    const done = Number(r.epochs) || 0;
+    if (args >= 20 && done > 0 && done <= args * 0.5 && (r.status === "external" || r.status === "incomplete" || r.status === "interrupted" || r.status === "failed")) {
+      out.push({
+        kind: "run",
+        id: r.id,
+        name: r.name,
+        path: r.dir,
+        bytes: r.bytes,
+        reason: `只跑了 ${done}/${args} 轮（远少于配置）；不是插件启动的记录，不能断言中断`,
+        refs: { deployments: r.deploymentIds || [] },
+        risk: "warn",
+        preset: false,
+      });
+    } else if (r.status === "external" && args >= 20 && done > args * 0.5 && done < args && r.hasBest) {
+      out.push({
+        kind: "run",
+        id: r.id,
+        name: r.name,
+        path: r.dir,
+        bytes: r.bytes,
+        reason: `${done}/${args} 轮，有 best.pt——可能是早停，不是失败；确认不需要再回收`,
+        refs: { deployments: r.deploymentIds || [] },
+        risk: "info",
+        preset: false,
+      });
+    }
+  }
+  let runNames = [];
+  try {
+    runNames = fs.readdirSync(project, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    runNames = [];
+  }
+  for (const name of runNames) {
+    if (catalog.runs && catalog.runs[name]) continue;
+    const d = path.join(project, name);
+    if (fs.existsSync(path.join(d, "weights", "best.pt")) || fs.existsSync(path.join(d, "results.csv"))) continue;
+    const st = walkStats(d);
+    out.push({
+      kind: "dir",
+      id: name,
+      name,
+      path: d.replace(/\\/g, "/"),
+      bytes: st.bytes,
+      reason: "不是训练 run（没有 results.csv / 权重），只是占目录",
+      refs: {},
+      risk: "safe",
+      preset: false,
+    });
+  }
+  for (const ds of Object.values(catalog.datasets || {})) {
+    for (const x of ds.extras || []) {
+      if (!["origin", "origin_json_backup"].includes(x.name) && !/\.zip$/i.test(x.name)) continue;
+      out.push({
+        kind: "extra",
+        id: `${ds.id}::${x.name}`,
+        datasetId: ds.id,
+        name: x.name,
+        path: path.join(ds.dir, x.name).replace(/\\/g, "/"),
+        bytes: x.bytes,
+        reason: "数据集的 legacy extras：原始素材应在 annotations/，YOLO 标准结构里不该有它",
+        refs: { dataset: ds.id },
+        risk: "info",
+        preset: false,
+      });
+    }
+  }
+  const evals = scanEvals(50);
+  const exports = scanExports(50);
+  const runBest = new Set(Object.values(catalog.runs || {}).map((r) => String(r.best || "").replace(/\\/g, "/").toLowerCase()).filter(Boolean));
+  const runWeights = new Set(Object.values(catalog.runs || {}).map((r) => String(r.argsWeights || "").replace(/\\/g, "/").toLowerCase()).filter(Boolean));
+  const matchW = (w) => {
+    const k = String(w || "").replace(/\\/g, "/").toLowerCase();
+    return !!k && (runBest.has(k) || runWeights.has(k));
+  };
+  for (const e of evals) {
+    if (matchW(e.weights)) continue;
+    out.push({
+      kind: "eval",
+      id: e.name,
+      name: e.name,
+      path: e.dir,
+      bytes: pathBytes(e.dir).bytes,
+      reason: "评估结果找不到源 run（orphan）；不是当前任何 run 的权重",
+      refs: {},
+      risk: "info",
+      preset: false,
+    });
+  }
+  for (const e of exports) {
+    if (matchW(e.weights)) continue;
+    out.push({
+      kind: "export",
+      id: e.name,
+      name: e.name,
+      path: e.dir,
+      bytes: pathBytes(e.dir).bytes,
+      reason: "导出结果找不到源 run（orphan）",
+      refs: {},
+      risk: "info",
+      preset: false,
+    });
+  }
+  return out;
+}
+
+/** 把一条清理项变成可执行的动作；引用图在这里生效。 */
+function planItem(catalog, item, cascade, actions, blocked) {
+  const add = (kind, id, target, bytes, refs, reason, isCascade) => {
+    const key = path.resolve(target).toLowerCase();
+    if (actions.some((a) => path.resolve(a.path).toLowerCase() === key)) return;
+    actions.push({ kind, id, path: target.replace(/\\/g, "/"), bytes: Number(bytes) || 0, refs: refs || {}, reason: String(reason || ""), cascade: !!isCascade });
+  };
+  const block = (why) => blocked.push({ kind: item.kind, id: item.id || item.name || "", path: item.path || "", why: String(why) });
+  const kind = String(item.kind || "");
+  if (kind === "model") {
+    const p = abs(item.path || "");
+    ensureInside(abs("models"), p, "模型副本");
+    if (!fs.existsSync(p)) return block("文件已经不在");
+    const m = Object.values(catalog.models || {}).find((x) => (x.paths || []).some((q) => path.resolve(q).toLowerCase() === path.resolve(p).toLowerCase()));
+    if (!m) return block("资产台账里没有这枚模型；刷新一次再试");
+    const refs = m.refs || {};
+    const other = (m.paths || []).filter((q) => path.resolve(q).toLowerCase() !== path.resolve(p).toLowerCase());
+    if (!other.length && ((refs.runs || []).length || (refs.deployments || []).length) && !cascade) {
+      return block(`这是唯一副本，仍被 ${(refs.runs || []).join("、") || "run"} / ${(refs.deployments || []).join("、") || "部署包"} 引用；勾选连带或先换掉引用`);
+    }
+    add("model", m.id, p, pathBytes(p).bytes, refs, item.reason || "模型副本", false);
+    if (cascade && !other.length) {
+      for (const rid of refs.runs || []) {
+        const r = catalog.runs && catalog.runs[rid];
+        if (r) planItem(catalog, { kind: "run", id: rid, reason: "被模型引用，连带回收" }, true, actions, blocked);
+      }
+      for (const did of refs.deployments || []) {
+        const d = catalog.deployments && catalog.deployments[did];
+        if (d) add("deployment", did, d.dir, d.bytes, {}, "被模型引用，连带回收", true);
+      }
+    }
+    return;
+  }
+  if (kind === "run") {
+    const r = catalog.runs && catalog.runs[item.id];
+    if (!r) return block("台账里没有这个 run；刷新一次再试");
+    if ((r.deploymentIds || []).length && !cascade) return block(`仍被部署包引用：${r.deploymentIds.join("、")}；勾选连带或先删部署包`);
+    add("run", r.id, r.dir, r.bytes, { deployments: r.deploymentIds || [], datasetId: r.datasetId || "" }, item.reason || "训练产物", false);
+    if (cascade) for (const did of r.deploymentIds || []) {
+      const d = catalog.deployments && catalog.deployments[did];
+      if (d) add("deployment", did, d.dir, d.bytes, {}, "被 run 引用，连带回收", true);
+    }
+    return;
+  }
+  if (kind === "dataset") {
+    const ds = catalog.datasets && catalog.datasets[item.id];
+    if (!ds) return block("台账里没有这个数据集；刷新一次再试");
+    if ((ds.runIds || []).length && !cascade) return block(`仍被 ${ds.runIds.length} 个 run 引用：${ds.runIds.join("、")}；勾选连带或先删 run`);
+    add("dataset", ds.id, ds.dir, ds.bytes, { runs: ds.runIds || [] }, item.reason || "数据集", false);
+    if (cascade) for (const rid of ds.runIds || []) {
+      const r = catalog.runs && catalog.runs[rid];
+      if (r) planItem(catalog, { kind: "run", id: rid, reason: "被数据集引用，连带回收" }, true, actions, blocked);
+    }
+    return;
+  }
+  if (kind === "deployment") {
+    const d = catalog.deployments && catalog.deployments[item.id];
+    if (!d) return block("台账里没有这个部署包");
+    add("deployment", d.id, d.dir, d.bytes, {}, item.reason || "部署包副本（外部产物不动）", false);
+    return;
+  }
+  if (kind === "extra") {
+    const ds = catalog.datasets && catalog.datasets[item.datasetId];
+    if (!ds) return block("数据集不在台账里");
+    const name = String(item.name || "");
+    if (!(ds.extras || []).some((x) => x.name === name)) return block("这个额外目录已经不在数据集里");
+    const target = path.join(ds.dir, name);
+    ensureInside(ds.dir, target, "数据集额外目录");
+    add("extra", item.id || `${ds.id}::${name}`, target, pathBytes(target).bytes, { dataset: ds.id }, item.reason || "数据集额外目录", false);
+    return;
+  }
+  if (kind === "eval" || kind === "export") {
+    const base = abs(`${RUNS_DIR}/${kind === "eval" ? "eval" : "export"}`);
+    const p = abs(item.path || "");
+    ensureInside(base, p, kind === "eval" ? "评估结果" : "导出结果");
+    if (!fs.existsSync(p)) return block("目录已经不在");
+    add(kind, item.id || path.basename(p), p, pathBytes(p).bytes, {}, item.reason || "孤儿结果", false);
+    return;
+  }
+  if (kind === "dir") {
+    const base = abs(DEFAULTS.train.project);
+    const p = abs(item.path || "");
+    ensureInside(base, p, "runs 目录");
+    if (!fs.existsSync(p)) return block("目录已经不在");
+    add("dir", item.id || path.basename(p), p, pathBytes(p).bytes, {}, item.reason || "非 run 目录", false);
+    return;
+  }
+  block(`不认识的清理类型：${kind || "(空)"}`);
+}
+
+function cleanupPlan(catalog, items, cascade) {
+  const actions = [];
+  const blocked = [];
+  for (const it of Array.isArray(items) ? items : []) planItem(catalog, isObj(it) ? it : {}, !!cascade, actions, blocked);
+  // 先删孩子再删父目录：路径更深的排前面
+  actions.sort((a, b) => b.path.split("/").length - a.path.split("/").length || a.path.localeCompare(b.path));
+  return { ok: blocked.length === 0, actions, blocked, totalBytes: actions.reduce((n, a) => n + a.bytes, 0) };
+}
+
+
+function listDeploymentBundles() {
+  const base = abs(`${RUNS_DIR}/deploy`);
+  const out = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(base, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    return out;
+  }
+  for (const n of names) {
+    const d = path.join(base, n);
+    const meta = readJson(path.join(d, "deployment.json"), null);
+    const st = walkStats(d);
+    out.push({
+      id: isObj(meta) && meta.id ? String(meta.id) : n,
+      name: n,
+      dir: d.replace(/\\/g, "/"),
+      bytes: st.bytes,
+      files: st.files,
+      ...(isObj(meta) ? meta : {}),
+    });
+  }
+  return out.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+}
+
+let catalogCache = { at: 0, value: null };
+
+/**
+ * 资产索引：文件系统是真相，catalog 只是索引。它可在任意时刻重建；
+ * 只读模式只返回内存结果，不写盘。
+ */
+async function catalogBuild(force) {
+  if (!root) return { schemaVersion: 1, updatedAt: new Date().toISOString(), datasets: {}, runs: {}, models: {}, deployments: {}, trash: [], storage: {}, readOnly: true };
+  if (!force && catalogCache.value && Date.now() - catalogCache.at < 10000) return catalogCache.value;
+  const { effective } = await effectiveConfig();
+  const project = effective.train.project;
+
+  const datasets = {};
+  const datasetByDir = {};
+  for (const d of scanDatasetDirs()) {
+    const ds = scanDataset(d.dir);
+    const st = walkStats(d.dir);
+    const fp = datasetFingerprintFor(d.dir, ds);
+    const id = `ds-${String(d.name || "dataset").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "dataset"}-${fp.slice(0, 8)}`;
+    const entry = {
+      id,
+      name: String(d.name || path.basename(d.dir)),
+      dir: d.dir,
+      dataYaml: d.dataYaml,
+      classes: ds.classes || [],
+      splits: { train: ds.trainCount || 0, val: ds.valCount || 0 },
+      bytes: st.bytes,
+      files: st.files,
+      fingerprint: fp,
+      extras: datasetExtras(d.dir),
+      runIds: [],
+      status: ds.exists && (ds.trainCount || ds.valCount) ? "ready" : "incomplete",
+      updatedAt: st.newest,
+    };
+    datasets[id] = entry;
+    datasetByDir[d.dir.toLowerCase()] = id;
+  }
+
+  const runs = {};
+  for (const r of scanRuns(project)) {
+    const p = runProfile(project, r.name);
+    const meta = readRunMeta(r.name);
+    const status = runStatusOf(r.name, p, meta);
+    const st = walkStats(p.dir);
+    const dataPath = String(p.argsData ? abs(p.argsData) : "").replace(/\\/g, "/");
+    const dsDir = dataPath ? path.dirname(dataPath).replace(/\\/g, "/").toLowerCase() : "";
+    const datasetId = datasetByDir[dsDir] || "";
+    runs[r.name] = {
+      id: r.name,
+      name: r.name,
+      dir: p.dir,
+      status: status.status,
+      statusLabel: status.label,
+      statusWhy: status.why,
+      managed: status.managed,
+      epochs: p.epochs,
+      argsEpochs: p.argsEpochs,
+      bestEpoch: p.bestEpoch,
+      hasBest: p.hasBest,
+      hasLast: p.hasLast,
+      bytes: st.bytes,
+      files: st.files,
+      datasetId,
+      datasetName: datasetId ? datasets[datasetId].name : "",
+      dataPath,
+      argsWeights: String(p.argsWeights || ""),
+      best: p.best,
+      bestSha: p.best ? sha256File(p.best) : "",
+      last: p.last,
+      finishedAt: p.finishedAt,
+      startedAt: p.startedAt,
+      mAP50M: p.mAP50M,
+      mAP5095M: p.mAP5095M,
+      note: p.note,
+      snapshot: meta && meta.snapshot ? String(meta.snapshot) : "",
+      log: meta && meta.log ? String(meta.log) : "",
+      deploymentIds: [],
+    };
+    if (datasetId) datasets[datasetId].runIds.push(r.name);
+  }
+
+  const models = {};
+  const modelByPath = {};
+  const modelBySha = {};
+  for (const f of scanModels(200)) {
+    const sha = sha256File(f.file);
+    const key = sha || `path:${f.file}`;
+    const origin = /\/models\/delivered\//i.test(f.file) ? "delivered" : /\/models\/pretrained\//i.test(f.file) ? "downloaded" : "local";
+    if (!models[key]) {
+      const facts = factsFor(f);
+      models[key] = {
+        id: `mdl-${(sha || key).slice(0, 8)}`,
+        sha256: sha,
+        bytes: f.bytes,
+        paths: [],
+        task: (facts && facts.task) || f.task || "",
+        family: f.family || "",
+        scale: f.scale || "",
+        nc: facts && facts.nc != null ? facts.nc : null,
+        names: [],
+        origin,
+        sourceRun: "",
+        license: "",
+        refs: { runs: [], deployments: [] },
+        verifiedAt: 0,
+      };
+    }
+    const m = models[key];
+    if (!m.paths.includes(f.file)) m.paths.push(f.file);
+    if (!m.bytes) m.bytes = f.bytes;
+    modelByPath[f.file.toLowerCase()] = key;
+  }
+  for (const r of Object.values(runs)) {
+    if (r.bestSha && models[r.bestSha]) {
+      models[r.bestSha].refs.runs.push(r.id);
+      if (!models[r.bestSha].sourceRun) models[r.bestSha].sourceRun = r.id;
+    }
+    const argsWeights = String(r.argsWeights ? abs(r.argsWeights) : "").replace(/\\/g, "/").toLowerCase();
+    if (argsWeights && modelByPath[argsWeights]) {
+      const k = modelByPath[argsWeights];
+      if (!models[k].refs.runs.includes(r.id)) models[k].refs.runs.push(r.id);
+    }
+  }
+
+  const deployments = {};
+  for (const d of listDeploymentBundles()) {
+    deployments[d.id] = d;
+    if (d.modelId && models[d.modelId]) models[d.modelId].refs.deployments.push(d.id);
+    if (d.runId && runs[d.runId]) runs[d.runId].deploymentIds.push(d.id);
+  }
+
+  const trash = listTrash();
+  const external = externalCacheStats();
+  const sum = (arr, k) => arr.reduce((n, x) => n + (Number(x[k]) || 0), 0);
+  const storage = {
+    datasets: sum(Object.values(datasets), "bytes"),
+    runs: sum(Object.values(runs), "bytes"),
+    models: sum(Object.values(models), "bytes"),
+    deployments: sum(Object.values(deployments), "bytes"),
+    trash: sum(trash, "bytes"),
+    external: external ? Number(external.bytes) || 0 : 0,
+    freeBytes: 0,
+    totalBytes: 0,
+  };
+  try {
+    const s = fs.statfsSync(root);
+    storage.freeBytes = Number(s.bavail) * Number(s.bsize) || 0;
+    storage.totalBytes = Number(s.blocks) * Number(s.bsize) || 0;
+  } catch {
+    /* Windows 上有些文件系统不支持 statfs；留 0，界面不显示 */
+  }
+  const catalog = {
+    schemaVersion: 1,
+    updatedAt: new Date().toISOString(),
+    datasets,
+    runs,
+    models,
+    deployments,
+    trash,
+    storage,
+    external,
+    audit: readAudit(30),
+    retention: { keepDays: readPrefs().trashKeepDays || 0 },
+    readOnly: !canWrite(),
+  };
+  catalog.suggestions = cleanupSuggestions(catalog, project);
+  if (canWrite()) {
+    const prev = readJson(abs(CATALOG_FILE), null);
+    const a = prev ? JSON.stringify({ ...prev, updatedAt: "" }) : "";
+    const b = JSON.stringify({ ...catalog, updatedAt: "" });
+    if (force || a !== b) writeJsonAtomic(abs(CATALOG_FILE), catalog);
+  }
+  catalogCache = { at: Date.now(), value: catalog };
+  return catalog;
 }
 
 /** 深合并（只合对象，数组整体替换：类别表不该被"合并"成两倍长）。 */
@@ -1073,6 +2024,15 @@ function fmtDuration(sec) {
   return s + "s";
 }
 
+/** 字节 → 人能读的体积（面板另有一份；插件侧日志/进度也用同一套口径）。 */
+function fmtBytes(bytes) {
+  const v = Number(bytes) || 0;
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+  if (v < 1024 * 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} MB`;
+  return `${(v / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
 /** 训练记录：`<project>/<name>/results.csv` 的最后一行就是这一轮的最新指标。 */
 function scanRuns(project) {
   const dir = project || abs(DEFAULTS.train.project);
@@ -1633,6 +2593,25 @@ function finishJob(j, code) {
       /* 同上 */
     }
   }
+  if (j.kind === "train" && j.runName) {
+    const runDir = path.join(abs(j.project || DEFAULTS.train.project), j.runName);
+    const has = (rel) => fs.existsSync(path.join(runDir, rel));
+    writeRunMeta(j.runName, {
+      status: j.stopped ? "stopped" : code === 0 ? "succeeded" : "failed",
+      finishedAt: j.endedAt,
+      exitCode: code,
+      reason: j.stopped ? "你按的停止" : code === 0 ? "" : (lastFailure && lastFailure.label) || "",
+      artifacts: {
+        best: has("weights/best.pt"),
+        last: has("weights/last.pt"),
+        resultsCsv: has("results.csv"),
+        argsYaml: has("args.yaml"),
+      },
+      datasetFingerprint: j.datasetFingerprint || "",
+      log: j.logPath,
+      snapshot: j.configPath || "",
+    });
+  }
   if (active === j) active = null;
 }
 
@@ -1662,6 +2641,9 @@ async function startJob(kind, overrides) {
     const block = taskBlock(merged);
     if (!block.mismatch.ok) throw new Error(block.mismatch.why);
     if (!block.resume.ok) throw new Error(block.resume.why);
+    // P177-E 磁盘守卫：按同类 run 的实测体积 × 1.5 预估。宁可现在说一句，也不要跑到一半盘满。
+    const disk = await diskGuard();
+    if (!disk.ok) throw new Error(disk.note);
   }
 
   const runner = kind === "train" ? path.join(PKG_DIR, "runner", "train_job.py").replace(/\\/g, "/") : abs("scripts/build_dataset.py");
@@ -1695,6 +2677,27 @@ async function startJob(kind, overrides) {
   }
 
   job.configPath = confPath;
+  job.project = String(merged.train.project || "");
+  job.dataPath = String(merged.train.data || path.join(merged.dataset.output_dir || "", "data.yaml")).replace(/\\/g, "/");
+  job.datasetFingerprint = datasetFingerprintFor(merged.dataset.output_dir);
+  if (kind === "train") {
+    job.runName = String(merged.train.name || "");
+    writeRunMeta(job.runName, {
+      status: "running",
+      jobId: job.id,
+      startedAt: job.startedAt,
+      snapshot: confPath,
+      log: job.logPath,
+      dataPath: job.dataPath,
+      datasetFingerprint: job.datasetFingerprint,
+      pluginVersion: PLUGIN_VERSION,
+      appVersion: "",
+    });
+  }
+  rememberPath("weights", merged.train.weights, "train");
+  rememberPath("data", job.dataPath, "train");
+  rememberPath("output_dir", merged.dataset.output_dir, kind);
+  for (const src of merged.dataset.sources || []) rememberPath("sources", src, kind);
   jobs.set(job.id, job);
   active = job;
 
@@ -1788,6 +2791,11 @@ async function applyPatch(patch) {
   fs.mkdirSync(path.dirname(overridesPath()), { recursive: true });
   fs.writeFileSync(overridesPath(), JSON.stringify(next, null, 2), "utf8");
   baseCache = { mtime: 0, value: null, error: "", source: "" }; // 让下次 state() 重算
+  try {
+    rememberConfigPaths((await effectiveConfig()).effective);
+  } catch {
+    /* 记路径失败不影响保存 */
+  }
   return await panelState();
 }
 
@@ -1851,6 +2859,7 @@ function readDeployConfig(name) {
     // 校准图与 opset 也要读出来：换数据集后最容易忘改的就是校准来源，量化的好坏全看它
     calib: pick("CalibSources"),
     opset: pick("Opset"),
+    labels: pick("Labels"),
   };
 }
 
@@ -1886,10 +2895,34 @@ function deliverBest(modelName, project) {
   if (!best) return { ok: false, error: "工作区里没有找到训练产物（runs/<run>/weights/best.pt）" };
   const dstDir = abs("models/delivered");
   fs.mkdirSync(dstDir, { recursive: true });
-  const stem = String(modelName || best.run || "model").replace(/[^\w.-]+/g, "-");
-  const dst = path.join(dstDir, `${stem}-best.pt`);
+  // 传对象/路径/空串都要能活：旧版 String({}) 会生出一个 -object-Object--best.pt
+  let hinted = isObj(modelName)
+    ? String(modelName.name || modelName.run || modelName.file || "")
+    : String(modelName == null ? "" : modelName);
+  hinted = hinted.trim();
+  if (/[\\/]/.test(hinted)) hinted = path.basename(hinted).replace(/\.pt$/i, "");
+  let stem = hinted.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+  if (!stem || /object-Object/i.test(stem)) {
+    stem = String(best.run || "model").replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "model";
+  }
+  const srcSha = sha256File(best.path);
+  let dst = path.join(dstDir, `${stem}-best.pt`);
+  if (fs.existsSync(dst)) {
+    if (srcSha && sha256File(dst) === srcSha) {
+      return { ok: true, path: dst.replace(/\\/g, "/"), from: best.path, run: best.run, bytes: fs.statSync(dst).size, duplicate: true, sha256: srcSha };
+    }
+    for (let n = 2; fs.existsSync(dst) && n < 100; n++) dst = path.join(dstDir, `${stem}-${n}-best.pt`);
+  }
   fs.copyFileSync(best.path, dst);
-  return { ok: true, path: dst, from: best.path, run: best.run, bytes: fs.statSync(dst).size };
+  return {
+    ok: true,
+    path: dst.replace(/\\/g, "/"),
+    from: best.path,
+    run: best.run,
+    bytes: fs.statSync(dst).size,
+    duplicate: false,
+    sha256: srcSha || sha256File(dst),
+  };
 }
 
 /**
@@ -2067,11 +3100,288 @@ async function pickLists() {
     datasets,
     devices: await deviceChoices(),
     calib: calibCandidates(),
+    recent: readPrefs().recent,
     current: {
       weights: String((effective.train && effective.train.weights) || "").replace(/\\/g, "/"),
       data: path.join(abs(effective.dataset.output_dir || ""), "data.yaml").replace(/\\/g, "/"),
     },
   };
+}
+
+/* ============================ 部署目标画像（P177-D） ============================ */
+
+/**
+ * 一个目标画像，不是两个。两份 `deploy_config*.ps1` 只是两份**外部底座**（只读），
+ * 它们之间的差别是部署实例的参数，不是两套硬件。
+ */
+const DEPLOY_TARGET = {
+  id: "maixcam2-pulsar2-4.0",
+  title: "MaixCAM2 · Pulsar2 4.0",
+  tool: { kind: "maixcam2_deploy", runBat: "run.bat", deployPs1: "deploy.ps1" },
+  input: { width: 640, height: 480, opset: 11 },
+  runtime: { dockerImage: "pulsar2:4.0" },
+  model: { families: ["yolo11", "yolov8"], tasks: ["detect", "segment"], labels: "from-model" },
+  calibration: { samples: 100, seed: 42, minSamples: 60, sourcePolicy: "dataset-train-images" },
+  outputs: { workDir: "work", calibDir: "calib", outDir: "out", deployDir: "deploy" },
+  // YOLO26 是插件能训的，但**目标工具没声明支持**：不拦死，只给警告，让用户自己决定
+  unsupportedFamilies: ["yolo26"],
+};
+
+function deployConfigIssues(cfg, effective) {
+  const out = [];
+  if (!cfg || !cfg.ok) return out;
+  const targetData = path.join(abs(effective.dataset.output_dir || ""), "images", "train").replace(/\\/g, "/").toLowerCase();
+  const calib = String(cfg.calib || "").replace(/\\/g, "/").toLowerCase();
+  if (cfg.model && /\/models\/delivered\/best\.pt$|\/models\/best\.pt$/i.test(String(cfg.model).replace(/\\/g, "/"))) {
+    out.push({ level: "warn", text: "模型指向旧 best.pt（不是某次 run 的固定版本）" });
+  }
+  if (cfg.modelName === "best") {
+    out.push({ level: "warn", text: "模型名是通用的 best——上板后分不清是哪一版" });
+  }
+  if (calib && targetData && calib !== targetData) {
+    out.push({ level: "warn", text: `校准来源 ${cfg.calib} 与当前数据集的 images/train 不一致；量化可能偏，建议改成当前数据集` });
+  }
+  if (String(cfg.opset || "") && String(cfg.opset) !== String(DEPLOY_TARGET.input.opset)) {
+    out.push({ level: "warn", text: `opset=${cfg.opset}（目标画像默认 ${DEPLOY_TARGET.input.opset}）` });
+  }
+  if (cfg.docker && String(cfg.docker) !== DEPLOY_TARGET.runtime.dockerImage) {
+    out.push({ level: "warn", text: `镜像 ${cfg.docker}（目标画像默认 ${DEPLOY_TARGET.runtime.dockerImage}）` });
+  }
+  return out;
+}
+
+function countImages(dir, cap) {
+  let n = 0;
+  const walk = (d, depth) => {
+    if (depth > 2 || n >= (cap || 5000)) return;
+    let ents = [];
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of ents) {
+      if (n >= (cap || 5000)) return;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else if (IMAGE_RE.test(e.name)) n += 1;
+    }
+  };
+  walk(dir, 0);
+  return n;
+}
+
+/** 开跑前校验：只读、不启动任何进程。blockers 拦住，warnings 需要用户勾一下。 */
+async function deployPrecheck(req) {
+  needWorkspace();
+  const o = isObj(req) ? req : {};
+  const { effective } = await effectiveConfig();
+  const checks = [];
+  const blockers = [];
+  const warnings = [];
+  const add = (level, text, extra) => {
+    const row = { level, text, ...(extra || {}) };
+    checks.push(row);
+    if (level === "bad") blockers.push(row);
+    if (level === "warn") warnings.push(row);
+  };
+
+  const modelPath = abs(String(o.model || effective.train.weights || ""));
+  const modelFacts = modelPath && fs.existsSync(modelPath) ? (scanModels(80).find((f) => f.file.toLowerCase() === modelPath.toLowerCase()) || null) : null;
+  const inf = inferWeights(modelPath);
+  if (!modelPath || !fs.existsSync(modelPath)) add("bad", `找不到要部署的权重：${modelPath || "(没填)"}`);
+  else {
+    add("ok", `模型：${path.basename(modelPath)}（${fmtBytes(fs.statSync(modelPath).size)}）`);
+    const task = (modelFacts && modelFacts.task) || inf.task || "";
+    if (!task) add("warn", "读不出任务（文件名也不是官方命名）：部署前请确认它是检测还是分割");
+    else if (!DEPLOY_TARGET.model.tasks.includes(task)) add("bad", `目标只支持 ${DEPLOY_TARGET.model.tasks.join(" / ")}，这枚是 ${task}`);
+    else add("ok", `任务：${task}`);
+    const fam = (modelFacts && modelFacts.family) || inf.family || "";
+    if (fam && DEPLOY_TARGET.unsupportedFamilies.includes(fam)) {
+      add("warn", `${fam} 是插件能训的，但目标工具（Pulsar2 4.0 配方）没有声明支持；导出的包可能上不了板`);
+    }
+  }
+
+  // 配方里的 $Labels 非空时：数量必须和权重自带类别数一致，否则上板后类别整体错位
+  const cfg = o.cfgName ? readDeployConfig(String(o.cfgName)) : null;
+  if (cfg && cfg.ok && String(cfg.labels || "").trim()) {
+    const want = String(cfg.labels).split(/[,，\s]+/).filter(Boolean).length;
+    const facts = modelFacts ? factsFor(modelFacts) : null;
+    const nc = facts && facts.nc != null ? facts.nc : null;
+    if (nc != null && want !== Number(nc)) {
+      add("bad", `配方的 Labels 有 ${want} 个类别，而权重自带 ${nc} 个：上板后类别会整体错位`);
+    } else {
+      add("ok", `Labels：${want} 个类别${nc != null ? "（与权重一致）" : "（权重没读过 nc，跑之前点一次「读一遍权重」）"}`);
+    }
+    const dsN = (effective.dataset.classes || []).length;
+    if (dsN && want !== dsN) add("warn", `Labels 有 ${want} 个，当前数据集类别表有 ${dsN} 个：确认这是同一套类别顺序`);
+  }
+
+  const calibDir = String(o.calib || "").trim();
+  if (!calibDir || calibDir === "@config") {
+    add("warn", "校准来源跟配置文件走：面板没法替你核对它是不是当前训练集");
+  } else if (!fs.existsSync(calibDir)) {
+    add("bad", `校准目录不存在：${calibDir}`);
+  } else {
+    const n = countImages(calibDir, DEPLOY_TARGET.calibration.minSamples + 1);
+    if (n < DEPLOY_TARGET.calibration.minSamples) add("bad", `校准图只有 ${n} 张，少于目标要求的 ${DEPLOY_TARGET.calibration.minSamples} 张`);
+    else add("ok", `校准图：${n} 张`);
+    const want = path.join(abs(effective.dataset.output_dir || ""), "images", "train").replace(/\\/g, "/").toLowerCase();
+    const got = calibDir.replace(/\\/g, "/").toLowerCase();
+    if (want && got !== want) {
+      add("warn", "校准来源不是当前训练数据集的 images/train；INT8 量化可能偏，确认后勾选再跑");
+    } else if (want) {
+      add("ok", "校准来源与训练数据集一致");
+    }
+  }
+
+  const imgsz = Number(o.imgsz || DEPLOY_TARGET.input.width) || DEPLOY_TARGET.input.width;
+  if (imgsz % 32 !== 0) add("bad", `输入宽度 ${imgsz} 不是 32 的倍数`);
+  else add("ok", `输入 ${imgsz}×${DEPLOY_TARGET.input.height}`);
+  if (Number(o.opset || DEPLOY_TARGET.input.opset) !== DEPLOY_TARGET.input.opset) {
+    add("warn", `opset=${o.opset} 与目标默认 ${DEPLOY_TARGET.input.opset} 不同`);
+  }
+  const env = await dockerEnv();
+  if (env.ok) add("ok", `Docker ${env.version || "可用"}`);
+  else add(env.wsl === "broken" ? "bad" : "warn", env.hint || env.error || "Docker 不可用");
+
+  return { ok: blockers.length === 0, target: DEPLOY_TARGET, checks, blockers, warnings, needsCalibConfirm: warnings.some((w) => /校准来源不是当前训练数据集/.test(w.text)) };
+}
+
+/** 在外部目录里找一次打包的产物：只在 deploy/out/work/logs 里按名字找，不递归整盘。 */
+function scanExternalArtifacts(modelName) {
+  const tool = scanDeployTool();
+  if (!tool.bound) return { bound: false, dir: "", artifacts: [], meta: "", log: "", error: "还没绑外部目录" };
+  const name = String(modelName || "");
+  if (!name) return { bound: true, dir: tool.dir, artifacts: [], meta: "", log: "", error: "没有模型名" };
+  const want = [
+    `${name}.mud`,
+    `${name}_npu.axmodel`,
+    `${name}_vnpu.axmodel`,
+    `${name}.axmodel`,
+    `demo_${name}.py`,
+  ];
+  const artifacts = [];
+  for (const sub of ["deploy", "out"]) {
+    const d = path.join(tool.dir, sub);
+    for (const f of want) {
+      const p = path.join(d, f);
+      try {
+        const st = fs.statSync(p);
+        if (st.isFile() && !artifacts.some((a) => a.name === f)) {
+          artifacts.push({ name: f, bytes: st.size, sha256: sha256File(p), externalPath: p.replace(/\\/g, "/"), sub });
+        }
+      } catch {
+        /* 这个子目录里没有 */
+      }
+    }
+  }
+  let meta = "";
+  const mp = path.join(tool.dir, "work", "meta.json");
+  if (fs.existsSync(mp)) meta = mp;
+  let log = "";
+  const ld = path.join(tool.dir, "logs");
+  try {
+    const files = fs.readdirSync(ld).filter((f) => /\.(log|txt)$/i.test(f)).map((f) => ({ f, m: fs.statSync(path.join(ld, f)).mtimeMs })).sort((a, b) => b.m - a.m);
+    if (files.length) log = path.join(ld, files[0].f);
+  } catch {
+    /* 没有 logs 目录 */
+  }
+  return { bound: true, dir: tool.dir, artifacts, meta, log, error: artifacts.length ? "" : `外部目录里没找到 ${name} 的 .mud / axmodel / demo` };
+}
+
+/**
+ * 登记一次打包：把最终产物 + meta + 最近日志复制到 `train_runs/deploy/<bundle>/`，
+ * 计算 SHA，写 `deployment.json`。外部目录**只读**，一个字节都不写。
+ */
+async function deployRegister(req) {
+  needWorkspace();
+  if (!canWrite()) throw new Error("当前是只读模式：能看部署包，不能登记");
+  const o = isObj(req) ? req : {};
+  const { effective } = await effectiveConfig();
+  const cfgName = String(o.cfgName || "");
+  const cfg = cfgName ? readDeployConfig(cfgName) : { ok: false, modelName: "" };
+  const modelName = String(o.modelName || (cfg.ok ? cfg.modelName : "") || "").replace(/[^\w.-]+/g, "-");
+  if (!modelName) throw new Error("没有模型名：先在配方里设 $ModelName，或在面板里填一个");
+  const modelPath = abs(String(o.model || (cfg.ok ? cfg.model : "") || ""));
+  const calibDir = abs(String(o.calib || (cfg.ok ? cfg.calib : "") || ""));
+  const scan = scanExternalArtifacts(modelName);
+  if (!scan.artifacts.length) return { ok: false, error: scan.error, modelName };
+
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+  const id = `dep-${modelName}-${stamp}`;
+  const bundleDir = abs(`train_runs/deploy/${id}`);
+  fs.mkdirSync(bundleDir, { recursive: true });
+  const copied = [];
+  for (const a of scan.artifacts) {
+    const dest = path.join(bundleDir, a.name);
+    fs.copyFileSync(a.externalPath, dest);
+    copied.push({ name: a.name, bytes: a.bytes, sha256: a.sha256, from: a.externalPath });
+  }
+  let metaName = "";
+  if (scan.meta) {
+    metaName = "meta.json";
+    fs.copyFileSync(scan.meta, path.join(bundleDir, metaName));
+    copied.push({ name: metaName, bytes: fs.statSync(scan.meta).size, sha256: sha256File(scan.meta), from: scan.meta.replace(/\\/g, "/") });
+  }
+  let logName = "";
+  if (scan.log) {
+    logName = `convert-${path.basename(scan.log)}`;
+    fs.copyFileSync(scan.log, path.join(bundleDir, logName));
+    copied.push({ name: logName, bytes: fs.statSync(scan.log).size, sha256: sha256File(scan.log), from: scan.log.replace(/\\/g, "/") });
+  }
+
+  const runMatch = /\/runs\/([^/]+)\/weights\//i.exec(modelPath.replace(/\\/g, "/"));
+  const catalog = await catalogBuild(true);
+  const modelSha = modelPath && fs.existsSync(modelPath) ? sha256File(modelPath) : "";
+  const modelEntry = modelSha ? catalog.models[modelSha] : null;
+  const dataset = Object.values(catalog.datasets).find((d) => d.dir.toLowerCase() === abs(effective.dataset.output_dir || "").toLowerCase());
+  const calibFingerprint = (() => {
+    const d = String(calibDir || "").replace(/\\/g, "/");
+    if (!d) return "";
+    const ds = Object.values(catalog.datasets).find((x) => d.toLowerCase().startsWith(x.dir.toLowerCase()));
+    return ds ? ds.fingerprint : "";
+  })();
+  const matched = !!(
+    calibDir &&
+    dataset &&
+    calibDir.replace(/\\/g, "/").toLowerCase() === path.join(dataset.dir, "images", "train").replace(/\\/g, "/").toLowerCase()
+  );
+
+  const meta = {
+    schemaVersion: 1,
+    id,
+    name: modelName,
+    target: DEPLOY_TARGET.id,
+    targetTitle: DEPLOY_TARGET.title,
+    status: "packaged",
+    createdAt: new Date().toISOString(),
+    modelPath: modelPath.replace(/\\/g, "/"),
+    modelId: modelEntry ? modelEntry.id : modelSha ? `mdl-${modelSha.slice(0, 8)}` : "",
+    modelSha256: modelSha,
+    runId: runMatch ? runMatch[1] : "",
+    datasetId: dataset ? dataset.id : "",
+    datasetFingerprint: dataset ? dataset.fingerprint : "",
+    calibDir: calibDir.replace(/\\/g, "/"),
+    calibFingerprint,
+    calibMatched: matched,
+    recipe: cfgName,
+    artifacts: copied,
+    externalDir: scan.dir,
+    externalPaths: copied.map((c) => c.from),
+    logs: logName ? [logName] : [],
+    readOnlyExternal: true,
+  };
+  writeJsonAtomic(path.join(bundleDir, "deployment.json"), meta);
+  catalogCache = { at: 0, value: null };
+  externalCacheCache = { at: 0, value: null };
+  auditLog({ action: "deploy-register", kind: "deployment", id, path: bundleDir, bytes: copied.reduce((n, c) => n + c.bytes, 0) });
+  try {
+    ctx.panels.emit(PANEL, "assets", { reason: "deploy-register", id });
+  } catch {
+    /* 面板没开 */
+  }
+  return { ok: true, bundle: { ...meta, dir: bundleDir.replace(/\\/g, "/"), bytes: copied.reduce((n, c) => n + c.bytes, 0) }, state: await catalogBuild(true) };
 }
 
 async function deployState() {
@@ -2096,11 +3406,14 @@ async function deployState() {
   }
   return {
     tool,
-    configs,
+    target: DEPLOY_TARGET,
+    configs: configs.map((c) => ({ ...c, issues: c.ok ? deployConfigIssues(c, effective) : [] })),
     latest: best ? { path: best.path, run: best.run, at: best.at } : null,
     delivered,
     candidates: deployCandidates(effective.train.project),
     calib: calibCandidates(),
+    deployments: listDeploymentBundles(),
+    external: externalCacheStats(),
     jobs: [...jobs.values()].filter((j) => j.kind === "deploy").slice(-4).map(snapshot),
     active: active && active.kind === "deploy" ? snapshot(active) : null,
   };
@@ -2177,6 +3490,8 @@ async function deployStart(req) {
     calibDir = fs.existsSync(auto) ? auto : "";
   }
   const wrapper = writeWrapper(cfg.name, modelPath, cfg.modelName || "model", calibDir);
+  rememberPath("weights", modelPath, "deploy");
+  rememberPath("calib", calibDir || cfg.calib, "deploy");
 
   const label = `部署 ${cfg.modelName || cfg.name}${step === "all" ? "" : `（${step}）`}`;
   const job = newJob("deploy", label);
@@ -2191,9 +3506,15 @@ async function deployStart(req) {
   pushLine(job, `[工作台] 包装配置: ${wrapper}`, "sys");
   if (calibDir) {
     pushLine(job, `[工作台] 校准图: ${calibDir}（覆盖配置里的 ${cfg.calib || "未设置"}）`, "sys");
+    const want = path.join(abs(effective.dataset.output_dir || ""), "images", "train").replace(/\\/g, "/").toLowerCase();
+    if (want && calibDir.replace(/\\/g, "/").toLowerCase() !== want) {
+      pushLine(job, `[工作台] 注意：校准来源不是当前训练集的 images/train（${want}），INT8 量化可能偏`, "err");
+    }
   } else if (cfg.calib) {
     pushLine(job, `[工作台] 校准图仍用配置里的 ${cfg.calib}（当前数据集没有 images/train，没法替你换）`, "sys");
   }
+  pushLine(job, `[工作台] 目标：${DEPLOY_TARGET.title} · ${DEPLOY_TARGET.input.width}×${DEPLOY_TARGET.input.height} · opset ${DEPLOY_TARGET.input.opset} · ${DEPLOY_TARGET.runtime.dockerImage}`, "sys");
+  job.deployMeta = { modelName: cfg.modelName || "", modelPath, calibDir, cfgName: cfg.name, step };
   job.progress.phase = step === "validate" ? "check" : "prepare";
   job.progress.detail = step === "validate" ? "只检查环境，不动任何文件" : "准备 ONNX";
   emitJob(job);
@@ -2212,7 +3533,20 @@ async function deployStart(req) {
       env: { ...PY_ENV, },
       onStdout: (l) => pushLine(job, l, "out"),
       onStderr: (l) => pushLine(job, l, "err"),
-      onExit: (code) => finishJob(job, code),
+      onExit: (code) => {
+        finishJob(job, code);
+        // 打包成功后自动登记：把外部 deploy/ 与 out/ 里的最终产物复制进 train_runs/deploy/<bundle>/。
+        // 外部目录仍然只读；登记失败不影响这次部署的结果，只多一行说明。
+        if (code === 0 && !job.stopped && (step === "all" || step === "package")) {
+          Promise.resolve()
+            .then(() => deployRegister({ modelName: cfg.modelName || "", model: modelPath, calib: calibDir, cfgName: cfg.name }))
+            .then((r) => {
+              if (r && r.ok) pushLine(job, `[工作台] 部署包已登记：${r.bundle.dir}（${r.bundle.artifacts.length} 个产物）`, "sys");
+              else pushLine(job, `[工作台] 这次没登记部署包：${(r && r.error) || scanExternalArtifacts(cfg.modelName || "").error}`, "err");
+            })
+            .catch((e) => pushLine(job, `[工作台] 登记部署包失败：${(e && e.message) || e}`, "err"));
+        }
+      },
       onError: (e) => {
         pushLine(job, `[工作台] 起进程失败：${(e && e.message) || e}`, "sys");
         finishJob(job, -1);
@@ -2326,6 +3660,11 @@ async function activate(c) {
   ctx = c;
   root = String(c.workspace || "");
   c.log.info(root ? `YOLO 工作台已就绪；工作区 = ${root}` : "YOLO 工作台已就绪；**还没有登记工作区根**");
+  try {
+    reconcileRunMeta();
+  } catch {
+    /* 只读/没工作区时跳过；不挡启动 */
+  }
 
   c.panels.register(PANEL, {
     /** 面板挂载时调一次：环境、配置、数据集、训练记录、任务列表，一次拿全（少一轮往返）。 */
@@ -2535,12 +3874,23 @@ async function activate(c) {
       return saveRunNote(effective.train.project, String(o.run || ""), String(o.text || ""));
     },
 
-    /** 归档：复制 args/results/best 到 `archive/<run>-<时间>/`。**只复制，不搬走**。 */
+    /** 归档：复制 args/results/best 到 `train_runs/archive/<run>-<时间>/`。**只复制，不搬走**。 */
     async archiveRun(req) {
       needWorkspace();
       const o = isObj(req) ? req : {};
       const { effective } = await effectiveConfig();
       return archiveRun(effective.train.project, String(o.run || ""));
+    },
+
+    /** P177-E：续训计划（默认从 last.pt 开新 run；原生 resume 只是高级选项）。 */
+    async resumePlan(req) {
+      return await resumePlan(req);
+    },
+
+    /** P177-E：磁盘守卫（按同类 run 实测体积 × 1.5 预估）。 */
+    async diskGuard() {
+      needWorkspace();
+      return await diskGuard();
     },
 
     /* ---- 标注体检与增强预览（P175-W3）---- */
@@ -2585,6 +3935,97 @@ async function activate(c) {
       return await pickLists();
     },
 
+    /** P177-A：资产索引（数据集 / run / 模型 / 部署包 / 回收站 / 存储）。只读骨架先上。 */
+    async assetsState(force) {
+      needWorkspace();
+      return await catalogBuild(force === true);
+    },
+
+    /**
+     * P177-B：清理与回收站。`action` = suggest / preview / trash / restore / purge / purgeAll / audit。
+     * 所有删除都先进 `.uartix/yolo/trash`；永久删除只发生在 purge，且要二次确认文本。
+     */
+    async assetsCleanup(req) {
+      needWorkspace();
+      const o = isObj(req) ? req : {};
+      const action = String(o.action || "suggest");
+      if (action === "suggest") {
+        const c = await catalogBuild(false);
+        return { ok: true, suggestions: c.suggestions || [], audit: c.audit || [] };
+      }
+      if (action === "audit") return { ok: true, entries: readAudit(o.limit || 60) };
+      if (action === "retention") {
+        if (!canWrite()) throw new Error("当前是只读模式：能看保留策略，不能改");
+        const days = Math.max(0, Number(o.days) || 0);
+        const prefs = readPrefs();
+        prefs.trashKeepDays = days;
+        savePrefs(prefs);
+        catalogCache = { at: 0, value: null };
+        return { ok: true, keepDays: days, state: await catalogBuild(true) };
+      }
+      if (!canWrite()) throw new Error("当前是只读模式：能看资产，不能清理 / 恢复 / 永久删除");
+      if (action === "purgeOld") {
+        const r = purgeOldTrash(Number(o.days) || readPrefs().trashKeepDays, o.confirm);
+        catalogCache = { at: 0, value: null };
+        return { ...r, state: await catalogBuild(true) };
+      }
+      if (action === "preview") {
+        const c = await catalogBuild(false);
+        const plan = cleanupPlan(c, o.items, o.cascade);
+        return { ok: true, ...plan };
+      }
+      if (action === "trash") {
+        if (String(o.confirm || "") !== "清理") throw new Error("回收要二次确认：确认文本必须是「清理」");
+        const c = await catalogBuild(false);
+        const plan = cleanupPlan(c, o.items, o.cascade);
+        if (!plan.ok) return { ok: false, error: "有引用阻止，先处理下面这些条目", ...plan };
+        const moved = [];
+        for (const a of plan.actions) {
+          moved.push(
+            moveToTrash(a.path, {
+              kind: a.kind,
+              id: a.id,
+              name: path.basename(a.path),
+              refs: a.refs,
+              reason: a.reason,
+              cascade: a.cascade,
+            }),
+          );
+        }
+        catalogCache = { at: 0, value: null };
+        externalCacheCache = { at: 0, value: null };
+        return { ok: true, moved, plan, state: await catalogBuild(true) };
+      }
+      if (action === "restore") {
+        const r = restoreTrash(o.id);
+        catalogCache = { at: 0, value: null };
+        return { ...r, state: await catalogBuild(true) };
+      }
+      if (action === "purge") {
+        if (String(o.confirm || "") !== "删除") throw new Error("永久删除要二次确认：确认文本必须是「删除」");
+        const r = purgeTrash(o.id);
+        catalogCache = { at: 0, value: null };
+        return { ...r, state: await catalogBuild(true) };
+      }
+      if (action === "purgeAll") {
+        const r = purgeAllTrash(o.confirm);
+        catalogCache = { at: 0, value: null };
+        return { ...r, state: await catalogBuild(true) };
+      }
+      throw new Error(`不认识的资产动作：${action}`);
+    },
+
+    /** P177-C：官方权重清单 / 已下载状态 / 当前下载任务。 */
+    async modelDownloadState() {
+      needWorkspace();
+      return await modelDownloadState();
+    },
+
+    /** P177-C：下载一枚官方权重（只在白名单内，不自动设为训练权重）。 */
+    async modelDownload(req) {
+      return await modelDownload(req);
+    },
+
     async deployState() {
       return await deployState();
     },
@@ -2594,6 +4035,16 @@ async function activate(c) {
       return await deployStart(req);
     },
 
+    /** P177-D：开跑前校验（模型 / 校准 / 尺寸 / opset / Docker），只读不启动。 */
+    async deployPrecheck(req) {
+      return await deployPrecheck(req);
+    },
+
+    /** P177-D：把外部 deploy/out 里的最终产物登记成 train_runs/deploy/<bundle>/（外部只读）。 */
+    async deployRegister(req) {
+      return await deployRegister(req);
+    },
+
     /** 部署前问一句：Docker 引擎（以及它脚下的 WSL）到底能不能用。 */
     async deployEnv() {
       return await dockerEnv();
@@ -2601,7 +4052,8 @@ async function activate(c) {
 
     /** 只交付模型、不部署（"先把产物留一份"也是常见动作）。 */
     async deployDeliver(modelName) {
-      const r = deliverBest(modelName);
+      const { effective } = await effectiveConfig();
+      const r = deliverBest(modelName, effective.train.project);
       if (!r.ok) throw new Error(r.error);
       return { ...r, state: await deployState() };
     },
@@ -2732,6 +4184,61 @@ function readDataYaml(file) {
  * 一个上万张的数据集全读要几十秒，而体检的价值在前 400 个就能看出来。
  * 超了就报 `truncated`，宁可少报也不把面板卡住。
  */
+/**
+ * 完全相同的图（同一份文件被复制到 train/val 或两个数据集）：按大小分组，
+ * 只对"同尺寸 ≥2"的候选算 SHA256 —— 44G 数据集也不至于被读一遍。
+ */
+function findDuplicateImages(dirs, cap) {
+  const files = [];
+  const walk = (d, depth) => {
+    if (depth > 2 || files.length >= (cap || 3000)) return;
+    let ents = [];
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of ents) {
+      if (files.length >= (cap || 3000)) return;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else if (IMAGE_RE.test(e.name)) {
+        try {
+          const st = fs.statSync(p);
+          files.push({ p, size: st.size });
+        } catch {
+          /* 读不到就跳过 */
+        }
+      }
+    }
+  };
+  for (const d of dirs) walk(d, 0);
+  const bySize = new Map();
+  for (const f of files) {
+    if (!bySize.has(f.size)) bySize.set(f.size, []);
+    bySize.get(f.size).push(f.p);
+  }
+  const groups = [];
+  let hashed = 0;
+  for (const [size, list] of bySize) {
+    if (list.length < 2 || size < 1024) continue;
+    const bySha = new Map();
+    for (const p of list.slice(0, 40)) {
+      if (hashed >= 400) break;
+      const sha = sha256File(p);
+      hashed += 1;
+      if (!sha) continue;
+      if (!bySha.has(sha)) bySha.set(sha, []);
+      bySha.get(sha).push(p);
+    }
+    for (const [, paths] of bySha) {
+      if (paths.length > 1) groups.push({ size, count: paths.length, paths: paths.map((x) => x.replace(/\\/g, "/")).slice(0, 6), bytes: size * (paths.length - 1) });
+    }
+    if (groups.length >= 20) break;
+  }
+  return { scanned: files.length, hashed, groups: groups.slice(0, 20), reclaimBytes: groups.reduce((n, g) => n + g.bytes, 0) };
+}
+
 function auditDataset(dirIn, sample) {
   const dir = abs(dirIn || DEFAULTS.dataset.output_dir);
   const r = {
@@ -2797,6 +4304,26 @@ function auditDataset(dirIn, sample) {
   delete r.trainStems;
   delete r.valStems;
 
+  // P177 §6.3 新增两项：完全重复的图 + 投料口来源账（都只读）
+  try {
+    r.duplicates = findDuplicateImages([path.join(dir, "images", "train"), path.join(dir, "images", "val")], 3000);
+  } catch {
+    r.duplicates = { scanned: 0, hashed: 0, groups: [], reclaimBytes: 0 };
+  }
+  try {
+    const it = scanIntake();
+    r.intake = { dir: it.dir, exists: it.exists, subdirs: (it.subdirs || []).map((x) => ({ name: x.name, images: x.images, json: x.json })), loose: it.loose };
+  } catch {
+    r.intake = null;
+  }
+
+  if (r.duplicates && r.duplicates.groups.length) {
+    r.findings.push({
+      level: "warn",
+      key: "duplicateImages",
+      text: `发现 ${r.duplicates.groups.length} 组完全相同的图（最多算 ${r.duplicates.hashed} 张的 SHA256），多用约 ${fmtBytes(r.duplicates.reclaimBytes)}；重复图会让 val 指标偏乐观，去资产页处理前先确认。`,
+    });
+  }
   if (r.dataYaml.exists && r.dataYaml.nc != null && r.maxClassId >= r.dataYaml.nc) {
     r.findings.push({ level: "bad", key: "ncMismatch", text: `标签里出现了类别 id ${r.maxClassId}，而 data.yaml 的 nc 只有 ${r.dataYaml.nc}：引擎会直接拒或错位训练。` });
   }
@@ -2969,6 +4496,8 @@ async function evalStart(opts) {
   const weights = abs(String(o.weights || effective.eval?.model || effective.train.weights || ""));
   const data = abs(String(o.data || effective.eval?.data || "")) || path.join(abs(effective.dataset.output_dir), "data.yaml").replace(/\\/g, "/");
   const out = evalOutDir();
+  rememberPath("weights", weights, "eval");
+  rememberPath("data", data, "eval");
   const merged = merge({}, effective);
   merged.eval = {
     model: weights,
@@ -3173,6 +4702,8 @@ async function exportStart(req) {
   const data = abs(String(o.data || effective.eval?.data || "")) || path.join(abs(effective.dataset.output_dir), "data.yaml").replace(/\\/g, "/");
   const imgsz = Number(o.imgsz || effective.export?.imgsz || effective.train.imgsz || 640);
   const out = abs(`train_runs/export/${new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14)}`);
+  rememberPath("weights", weights, "export");
+  rememberPath("data", data, "export");
   const merged = merge({}, effective);
   merged.export = { format: fmt, imgsz, dynamic: !!o.dynamic, simplify: o.simplify !== false, opset: Number(o.opset) || 0, quantize: String(o.quantize || "") };
 
@@ -3240,6 +4771,238 @@ async function exportState() {
   };
 }
 
+/* ============================ 官方权重下载（P177-C） ============================ */
+
+/**
+ * v1 只认官方 ultralytics/assets 的这一个 release（与当前 ultralytics 8.4.102 的默认
+ * `attempt_download_asset` 一致）。升级包版本时改这一处，不做"任意 URL 下载"。
+ */
+const DL_RELEASE = "v8.4.0";
+const DL_HOSTS = ["github.com", "objects.githubusercontent.com", "raw.githubusercontent.com"];
+const DL_LICENSE = "AGPL-3.0";
+const DL_MAX_BYTES = 200 * 1024 * 1024;
+
+function dlUrl(name) {
+  return `https://github.com/ultralytics/assets/releases/download/${DL_RELEASE}/${name}`;
+}
+
+/** 官方清单：只列本插件真能训/能部署的两类（detect / segment）× YOLO11 / YOLO26。 */
+const OFFICIAL_WEIGHTS = (() => {
+  const out = [];
+  for (const family of ["yolo11", "yolo26"]) {
+    for (const scale of ["n", "s", "m", "l", "x"]) {
+      for (const task of ["detect", "segment"]) {
+        const name = `${family}${scale}${task === "segment" ? "-seg" : ""}.pt`;
+        out.push({ name, family, scale, task, url: dlUrl(name), license: DL_LICENSE });
+      }
+    }
+  }
+  return out;
+})();
+
+const dlLedgerPath = () => abs("models/pretrained/downloads.json");
+
+function readDownloadLedger() {
+  const j = readJson(dlLedgerPath(), null);
+  return isObj(j) && isObj(j.files) ? j : { schemaVersion: 1, release: DL_RELEASE, files: {} };
+}
+
+function writeDownloadLedger(next) {
+  if (!canWrite()) return;
+  fs.mkdirSync(path.dirname(dlLedgerPath()), { recursive: true });
+  writeJsonAtomic(dlLedgerPath(), { ...next, schemaVersion: 1, release: DL_RELEASE, updatedAt: new Date().toISOString() });
+}
+
+function officialTarget(nameIn) {
+  const item = OFFICIAL_WEIGHTS.find((x) => x.name === String(nameIn || ""));
+  if (!item) throw new Error(`不在官方清单里：${nameIn || "(空)"}。v1 只允许 ultralytics/assets 的 YOLO11 / YOLO26 检测与分割权重`);
+  return { ...item, path: abs(`models/pretrained/${item.family}/${item.name}`) };
+}
+
+/** 模型页的下载面板：清单 + 已下载 + 正在下 + 许可证/来源，一次拿全。 */
+async function modelDownloadState() {
+  const ledger = readDownloadLedger();
+  const items = OFFICIAL_WEIGHTS.map((x) => {
+    const rec = ledger.files[x.name] || null;
+    const target = abs(`models/pretrained/${x.family}/${x.name}`);
+    let bytes = 0;
+    try {
+      bytes = fs.statSync(target).size;
+    } catch {
+      /* 还没下 */
+    }
+    return {
+      ...x,
+      path: target,
+      exists: !!bytes,
+      bytes,
+      sha256: rec && rec.sha256 ? String(rec.sha256) : "",
+      downloadedAt: rec && rec.downloadedAt ? String(rec.downloadedAt) : "",
+    };
+  });
+  const { effective } = await effectiveConfig();
+  const running = active && active.kind === "download" ? snapshot(active) : null;
+  return {
+    ok: true,
+    release: DL_RELEASE,
+    license: DL_LICENSE,
+    hosts: DL_HOSTS,
+    maxBytes: DL_MAX_BYTES,
+    items,
+    installed: items.filter((x) => x.exists).length,
+    proxy: effective.env && effective.env.proxy_enable ? String(effective.env.proxy || "") : "",
+    active: running,
+    readOnly: !canWrite(),
+  };
+}
+
+/**
+ * 起一次下载。**不自动设为训练权重、不自动装包**：下完只落盘 + 记账 + 探针读事实，
+ * 用不用由用户回去点。已存在同路径时直接返回 exists，不重下。
+ */
+async function modelDownload(req) {
+  needWorkspace();
+  if (active) throw new Error(`已经有一个任务在跑（${active.label}）：先停掉它`);
+  if (!canWrite()) throw new Error("当前是只读模式：能看模型清单，不能下载");
+  const o = isObj(req) ? req : {};
+  const item = officialTarget(o.name);
+  if (fs.existsSync(item.path) && fs.statSync(item.path).size > 0) {
+    return { ok: true, exists: true, path: item.path, bytes: fs.statSync(item.path).size, name: item.name };
+  }
+  const py = await detectPython();
+  if (!py.ok) throw new Error(`找不到可用的 python：${py.error}`);
+  const runner = path.join(PKG_DIR, "runner", "download_job.py").replace(/\\/g, "/");
+  if (!fs.existsSync(runner)) throw new Error("插件包里没有 runner/download_job.py：重装一次插件");
+
+  // 磁盘守卫：官方权重最大 ~140MB，留 512MB 余量给 .part 与解压/缓存
+  let free = 0;
+  try {
+    const st = fs.statfsSync(root);
+    free = Number(st.bavail) * Number(st.bsize) || 0;
+  } catch {
+    /* 某些文件系统不支持 statfs；不拦 */
+  }
+  if (free && free < 512 * 1024 * 1024) {
+    throw new Error(`工作区可用空间只剩 ${fmtBytes(free)}，不够下载（至少留 512 MB）。先到资产页清理，再回来`);
+  }
+
+  const { effective } = await effectiveConfig();
+  const proxy = effective.env && effective.env.proxy_enable ? String(effective.env.proxy || "") : "";
+  const ledger = readDownloadLedger();
+  const rec = ledger.files[item.name] || null;
+  const job = newJob("download", `下载 ${item.name}`);
+  job.download = { name: item.name, target: item.path, url: item.url };
+  jobs.set(job.id, job);
+  active = job;
+
+  const args = [runner, "--url", item.url, "--out", item.path, "--max-bytes", String(DL_MAX_BYTES), "--allow-hosts", DL_HOSTS.join(",")];
+  if (proxy) args.push("--proxy", proxy);
+  if (rec && Number(rec.bytes) > 0) args.push("--expect-bytes", String(Number(rec.bytes)));
+  if (rec && rec.sha256) args.push("--expect-sha256", String(rec.sha256));
+  pushLine(job, `[工作台] 来源: ${item.url}（release ${DL_RELEASE}）`, "sys");
+  pushLine(job, `[工作台] 目标: ${item.path}`, "sys");
+  pushLine(job, proxy ? `[工作台] 代理: 已按工作区配置启用` : "[工作台] 代理: 未启用（直连）", "sys");
+  if (rec && rec.sha256) pushLine(job, `[工作台] 已有下载记录，会核对大小与 SHA256`, "sys");
+
+  try {
+    const child = ctx.process.spawn({
+      cmd: py.path,
+      args,
+      cwd: root,
+      env: { ...PY_ENV, OPENBLAS_NUM_THREADS: "1", PYTHONUNBUFFERED: "1" },
+      onStdout: (l) => onDownloadLine(job, l),
+      onStderr: (l) => pushLine(job, l, "err"),
+      onExit: (code) => {
+        finishJob(job, code);
+        if (!job.stopped && code === 0 && job.downloadResult && job.downloadResult.ok) {
+          const next = readDownloadLedger();
+          next.files[item.name] = {
+            name: item.name,
+            url: item.url,
+            release: DL_RELEASE,
+            license: DL_LICENSE,
+            bytes: Number(job.downloadResult.bytes) || 0,
+            sha256: String(job.downloadResult.sha256 || ""),
+            downloadedAt: new Date().toISOString(),
+            path: item.path,
+          };
+          writeDownloadLedger(next);
+          try {
+            ctx.panels.emit(PANEL, "assets", { reason: "download", name: item.name });
+          } catch {
+            /* 面板没开 */
+          }
+          // 探针读 task/nc：读不出就只记文件，不猜事实
+          Promise.resolve()
+            .then(() => modelLibrary(true))
+            .catch(() => {});
+        }
+        if (active === job) active = null;
+      },
+      onError: (e) => {
+        pushLine(job, `[工作台] 起进程失败：${(e && e.message) || e}`, "sys");
+        finishJob(job, -1);
+      },
+    });
+    job.pid = child.pid || 0;
+    job.child = child;
+  } catch (e) {
+    pushLine(job, `[工作台] 起进程失败：${(e && e.message) || e}`, "sys");
+    finishJob(job, -1);
+    throw e;
+  }
+  return snapshot(job);
+}
+
+/** 下载器的输出是 JSON 行；转成人能读的那一句再进日志，同时更新进度。 */
+function onDownloadLine(job, line) {
+  const text = String(line || "").trim();
+  if (!text) return;
+  if (!text.startsWith("{")) {
+    pushLine(job, text, "out");
+    return;
+  }
+  let m = null;
+  try {
+    m = JSON.parse(text);
+  } catch {
+    pushLine(job, text, "out");
+    return;
+  }
+  const p = job.progress;
+  if (m.type === "head") {
+    job.download.total = Number(m.total) || 0;
+    p.phase = "download";
+    p.detail = `文件大小 ${fmtBytes(m.total)}`;
+    pushLine(job, `[下载] 文件大小 ${fmtBytes(m.total)}`, "sys");
+  } else if (m.type === "progress") {
+    job.download.done = Number(m.done) || 0;
+    job.download.total = Number(m.total) || job.download.total || 0;
+    p.phase = "download";
+    p.percent = Number(m.pct) || 0;
+    p.detail = `${fmtBytes(job.download.done)} / ${job.download.total ? fmtBytes(job.download.total) : "未知"}` + (m.speed ? ` · ${fmtBytes(m.speed)}/s` : "");
+  } else if (m.type === "retry") {
+    pushLine(job, `[下载] 第 ${m.attempt} 次失败，正在重试：${m.error || ""}`, "err");
+    p.detail = "网络不稳，正在重试（.part 保留）";
+  } else if (m.type === "done") {
+    job.downloadResult = m;
+    p.phase = "done";
+    p.percent = 100;
+    p.detail = `${fmtBytes(m.bytes)} · SHA256 ${String(m.sha256 || "").slice(0, 12)}…`;
+    pushLine(job, `[下载] 完成：${m.path}`, "sys");
+    pushLine(job, `[下载] SHA256 ${m.sha256}`, "sys");
+  } else if (m.type === "cancelled") {
+    pushLine(job, `[下载] ${m.message || "已取消"}`, "sys");
+  } else if (m.type === "error") {
+    job.downloadError = String(m.message || "下载失败");
+    p.phase = "error";
+    p.detail = job.downloadError;
+    pushLine(job, `[错误] ${job.downloadError}`, "err");
+  } else {
+    pushLine(job, text, "out");
+  }
+}
+
 /* ============================ 实验管理（P175-W7，详设 §5.7 / §4.3） ============================ */
 
 /** 一个 run 的档案：面板上的实验列表就是它。 */
@@ -3265,12 +5028,14 @@ function runProfile(project, name) {
   }
   const rows = parsed.rows;
   const lastRow = rows.length ? rows[rows.length - 1] : {};
+  const hasResultsCsv = fs.existsSync(path.join(dir, "results.csv"));
   let finishedAt = 0;
   try {
     finishedAt = fs.statSync(path.join(dir, "results.csv")).mtimeMs;
   } catch {
     /* 没写出 csv */
   }
+  const durationSec = Number(lastRow.time) || 0;
   // 最佳轮按掩膜 mAP50-95 找（检测任务没有 M 列就退回框），而不是拿最后一轮冒名
   let bestEpoch = rows.length ? Number(lastRow.epoch) || rows.length : 0;
   let bestVal = -Infinity;
@@ -3288,7 +5053,7 @@ function runProfile(project, name) {
   } catch {
     /* 还没写过备注 */
   }
-  return {
+  const base = {
     name,
     dir: dir.replace(/\\/g, "/"),
     task: String(args.task || ""),
@@ -3297,6 +5062,11 @@ function runProfile(project, name) {
     epochs: rows.length,
     bestEpoch,
     finishedAt,
+    startedAt: finishedAt && durationSec > 0 ? Math.round(finishedAt - durationSec * 1000) : 0,
+    hasResultsCsv,
+    argsEpochs: Number(args.epochs) || 0,
+    argsData: String(args.data || ""),
+    argsWeights: String(args.weights || args.model || ""),
     hasBest,
     best: hasBest ? best.replace(/\\/g, "/") : "",
     bestBytes,
@@ -3313,6 +5083,8 @@ function runProfile(project, name) {
     argsFile: path.join(dir, "args.yaml").replace(/\\/g, "/"),
     argsKeys: Object.keys(args).length,
   };
+  const status = runStatusOf(name, base, readRunMeta(name));
+  return { ...base, status: status.status, statusLabel: status.label, statusWhy: status.why, managed: status.managed };
 }
 
 /** 实验列表（默认页那个表）。 */
@@ -3404,16 +5176,96 @@ function saveRunNote(project, name, text) {
 }
 
 /**
- * 归档：把 `args.yaml + results.csv + best.pt` **复制**进 `archive/<run>-<时间>/`。
+ * 归档：把 `args.yaml + results.csv + best.pt` **复制**进 `train_runs/archive/<run>-<时间>/`。
  *
  * 设计稿写的是"移"。这里刻意改成复制：搬走会让 `runs/` 里的历史断档，
  * 而那个目录是用户自己会去看的——断档的代价比多占一点磁盘大得多。
  */
+/**
+ * 中断/停止后的续训计划（P177-E）。
+ *
+ * 默认**开新 run**：`weights = last.pt`、`name = <原名>-resume`、`resume` 留空。
+ * 这样优化器状态保住了、原 run 的产物不被覆盖、曲线重新从第 1 轮计（看得清"续了多久"）。
+ * Ultralytics 原生 `resume=last.pt` 只作为高级选项：它会写回原 run 目录并接着原轮次，
+ * 跨包版本时容易失败，所以不放在默认路径上。
+ */
+async function resumePlan(req) {
+  needWorkspace();
+  const o = isObj(req) ? req : {};
+  const run = String(o.run || "");
+  if (!run) throw new Error("没说哪个 run");
+  const { effective } = await effectiveConfig();
+  const project = String(o.project || effective.train.project || DEFAULTS.train.project);
+  const dir = path.join(abs(project), run);
+  if (!fs.existsSync(dir)) throw new Error(`没有这个 run：${run}`);
+  const last = path.join(dir, "weights", "last.pt");
+  const args = readRunArgs(dir);
+  const native = String(o.mode || "new") === "native";
+  if (!fs.existsSync(last)) {
+    return {
+      ok: false,
+      run,
+      why: `这个 run 没有 weights/last.pt：${last}。没有优化器状态就没法续训；从 best.pt 接着训只会"从头开始但轮次接着数"，不要这么做。`,
+      patch: null,
+    };
+  }
+  const epochs = Number(args.epochs) || Number(effective.train.epochs) || 300;
+  const patch = {
+    task: String(args.task || effective.train.task || ""),
+    weights: last.replace(/\\/g, "/"),
+    data: String(args.data || effective.train.data || ""),
+    project: String(args.project || project),
+    name: native ? run : `${run}-resume`,
+    epochs,
+    resume: native ? last.replace(/\\/g, "/") : "",
+  };
+  return {
+    ok: true,
+    run,
+    native,
+    last: last.replace(/\\/g, "/"),
+    patch,
+    warnings: native
+      ? ["原生 resume 会写回原 run 目录、接着原轮次；跨 ultralytics 版本可能直接失败。产物会被这次续训覆盖。"]
+      : ["开新 run：原 run 不动，曲线从第 1 轮重新计；优化器状态来自 last.pt。", "跑之前确认 epochs 是「总共要跑到多少轮」，不是「再跑多少轮」——Ultralytics 的 epochs 是总轮次。"],
+  };
+}
+
+/** 训练前的磁盘守卫：按同类 run 的实测体积 × 1.5 预估；不够就明说，不启动。 */
+async function diskGuard() {
+  const { effective } = await effectiveConfig();
+  const project = abs(effective.train.project || DEFAULTS.train.project);
+  let sample = 0;
+  let count = 0;
+  for (const r of scanRuns(project).slice(0, 12)) {
+    if (!r.bytes) continue;
+    sample += r.bytes;
+    count += 1;
+  }
+  const perRun = count ? sample / count : 0;
+  const need = perRun ? perRun * 1.5 : 512 * 1024 * 1024;
+  let free = 0;
+  try {
+    const st = fs.statfsSync(root);
+    free = Number(st.bavail) * Number(st.bsize) || 0;
+  } catch {
+    return { ok: true, free: 0, need: 0, note: "这个文件系统不支持查询可用空间，跳过磁盘守卫" };
+  }
+  return {
+    ok: free >= need,
+    free,
+    need,
+    sampleRuns: count,
+    note: free >= need ? "" : `可用 ${fmtBytes(free)}，按同类 run 预估这次要 ${fmtBytes(need)}（${count} 个样本 × 1.5）。先到资产页清理，或把 project 换到空间更大的盘。`,
+  };
+}
+
 function archiveRun(project, name) {
+
   const run = runProfile(project, name);
   if (!run.dir || !fs.existsSync(run.dir)) throw new Error(`没有这个 run：${name}`);
   const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
-  const dst = abs(`archive/${String(name).replace(/[^\w.-]+/g, "-")}-${stamp}`);
+  const dst = abs(`${RUNS_DIR}/archive/${String(name).replace(/[^\w.-]+/g, "-")}-${stamp}`);
   fs.mkdirSync(path.join(dst, "weights"), { recursive: true });
   const copied = [];
   for (const [src, rel] of [
